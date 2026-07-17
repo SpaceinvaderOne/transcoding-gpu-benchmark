@@ -1,0 +1,1300 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GPU Transcode Benchmark</title>
+<style>
+  :root{
+    --bg:#0a0e14; --panel:#121823; --ink:#e8eef7; --muted:#7b8aa0;
+    --green:#2ecc71; --red:#e74c3c; --amber:#f1c40f;
+    --accent:#4aa3ff;            /* brand color — swapped per GPU vendor */
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%}
+  body{
+    background:radial-gradient(1200px 800px at 50% -10%,#16202e 0%,var(--bg) 60%);
+    color:var(--ink); font-family:"Segoe UI",system-ui,-apple-system,sans-serif;
+    padding:28px 32px; min-height:100%;
+  }
+  header{display:flex;justify-content:space-between;align-items:baseline;
+    border-bottom:1px solid #1e2b3d;padding-bottom:14px;margin-bottom:22px}
+  header h1{font-size:26px;font-weight:700;letter-spacing:.3px}
+  header .profile{color:var(--muted);font-size:15px}
+  header .profile b{color:var(--accent)}
+  .hwline{color:var(--muted);font-size:14px;margin-top:6px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .hwline b{color:var(--ink)} .hwline .warn{color:var(--amber)}
+  #verdict .specs .warn{color:var(--amber)}
+  #suberr{display:none;margin-top:12px;font-size:14px;color:var(--red);font-weight:600}
+  #suberr.show{display:block}
+  .vchip{display:inline-flex;align-items:center;gap:7px;font-size:12px;font-weight:700;
+    letter-spacing:1.5px;text-transform:uppercase;color:var(--accent);
+    border:1px solid var(--accent);border-radius:999px;padding:3px 11px}
+  .vchip .dot{width:9px;height:9px;border-radius:50%;background:var(--accent)}
+  .top{display:grid;grid-template-columns:1.1fr 1.5fr;gap:22px;margin-bottom:24px}
+  .panel{background:var(--panel);border:1px solid #1e2b3d;border-radius:16px;padding:22px 26px}
+  .label{color:var(--muted);font-size:14px;text-transform:uppercase;letter-spacing:2px;margin-bottom:8px}
+  .streams-num{font-size:120px;line-height:1;font-weight:800;letter-spacing:-2px}
+  .sub{color:var(--muted);font-size:15px;margin-top:10px}
+  .gauge{display:flex;align-items:flex-end;gap:12px}
+  .gauge .val{font-size:80px;line-height:.9;font-weight:800;letter-spacing:-2px}
+  .gauge .x{font-size:30px;color:var(--muted);font-weight:700;padding-bottom:8px}
+  .gauge.ok .val{color:var(--green)} .gauge.bad .val{color:var(--red)}
+  .meterwrap{margin-top:18px}
+  .meter{height:18px;border-radius:9px;background:#0c121b;overflow:hidden;border:1px solid #223247;position:relative}
+  .meter .fill{height:100%;border-radius:9px;transition:width .4s ease,background .3s}
+  .meter .line{position:absolute;top:-4px;bottom:-4px;width:2px;background:var(--amber);left:50%}
+  .meter-legend{display:flex;justify-content:space-between;color:var(--muted);font-size:12px;margin-top:6px}
+  .small-stats{display:flex;gap:30px;margin-top:16px}
+  .small-stats div span{display:block}
+  .small-stats .k{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:1.5px}
+  .small-stats .v{font-size:24px;font-weight:700;margin-top:3px}
+  .cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(116px,1fr));gap:12px}
+  .card{background:#0e1521;border:2px solid #233247;border-radius:12px;padding:14px 12px;text-align:center;transition:border-color .3s,background .3s}
+  .card.ok{border-color:var(--green);background:rgba(46,204,113,.08)}
+  .card.bad{border-color:var(--red);background:rgba(231,76,60,.10)}
+  .card .id{color:var(--muted);font-size:12px;letter-spacing:1px}
+  .card .spd{font-size:28px;font-weight:800;margin:4px 0}
+  .card.ok .spd{color:var(--green)} .card.bad .spd{color:var(--red)}
+  .card .fps{color:var(--muted);font-size:12px}
+  .flash{animation:flash .6s steps(1) infinite}
+  @keyframes flash{50%{background:rgba(231,76,60,.45);border-color:#ff6b5b}}
+  .status{color:var(--muted);font-size:15px;margin-top:18px;min-height:20px}
+  /* telemetry strip */
+  .tele{display:flex;gap:12px;flex-wrap:wrap;margin-top:16px}
+  .tele .t{background:#0e1521;border:1px solid #233247;border-radius:10px;padding:8px 14px;font-size:13px;min-width:96px}
+  .tele .t .tk{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:1px}
+  .tele .t .tv{font-size:20px;font-weight:700;margin-top:2px}
+  .tele .t.accent .tv{color:var(--accent)}
+  .tele .t[title]{cursor:help;border-bottom:1px dotted #3a4d66}
+  /* verdict overlay */
+  #verdict{position:fixed;inset:0;display:none;flex-direction:column;align-items:center;justify-content:center;justify-content:safe center;overflow-y:auto;
+    background:radial-gradient(900px 600px at 50% 40%,#11161f 0%,#070b11 70%);z-index:50;text-align:center;padding:40px}
+  #verdict.show{display:flex}
+  #verdict.fail{background:radial-gradient(900px 600px at 50% 40%,#3a1414 0%,#150606 70%)}
+  #verdict .accentbar{position:fixed;top:0;left:0;right:0;height:8px;background:var(--accent)}
+  #verdict.fail .accentbar{background:var(--red)}
+  #verdict .cap{color:var(--muted);font-size:22px;letter-spacing:4px;text-transform:uppercase}
+  #verdict .n{font-size:220px;line-height:1;font-weight:900;color:var(--accent);letter-spacing:-6px;margin:6px 0}
+  #verdict.fail .n{color:var(--red)}
+  #verdict .desc{font-size:25px;max-width:900px;color:var(--ink)}
+  #verdict .foot{color:var(--muted);font-size:16px;margin-top:18px;max-width:840px}
+  #verdict .specs{color:var(--muted);font-size:14px;margin-top:14px;max-width:840px}
+  #verdict .specs b{color:var(--ink)}
+  #verdict .eff{margin-top:20px;font-size:22px}
+  #verdict .eff .effmain{font-weight:800;color:var(--accent)}
+  #verdict .eff [title]{cursor:help;border-bottom:1px dotted #44566e}
+  #verdict .eff .pwrrow{font-size:16px;color:var(--muted);margin-top:6px}
+  #verdict .eff .pwrrow b{color:var(--ink)}
+  #verdict .insight{margin:14px auto 0;max-width:760px;font-size:16px;line-height:1.45;
+    color:#cdd9e8;background:rgba(74,163,255,.08);border:1px solid #25405d;border-radius:12px;padding:12px 18px}
+  /* conversion verdict: two co-equal panels (per-file speed | best worker count) */
+  #convbody{display:none;margin:16px auto 0;max-width:860px}
+  #convbody.show{display:block}
+  #convbody .cvcols{display:flex;gap:18px;align-items:stretch}
+  #convbody .cvcol{flex:1;background:#0e1521;border:1px solid #25405d;border-radius:12px;padding:18px 20px;text-align:center;display:flex;flex-direction:column}
+  #convbody .cvtitle{font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin-bottom:12px}
+  #convbody .cvbignum{font-size:44px;font-weight:800;color:var(--accent);line-height:1}
+  #convbody .cvbignum span{display:block;font-size:13px;font-weight:600;color:var(--muted);margin-top:5px}
+  #convbody .cvtimes{display:flex;flex-direction:column;gap:7px;font-size:15px;margin:16px 0 0;color:#cdd9e8}
+  #convbody .cvtimes b{color:var(--accent)}
+  #convbody .cvlib{font-size:13px;color:var(--muted);margin-top:auto;padding-top:14px;line-height:1.45}
+  #convbody .cvlib b{color:#cdd9e8}
+  #convbody .cvrec{font-size:26px;font-weight:800;color:var(--accent);line-height:1.1}
+  #convbody .cvrec span{display:block;font-size:12.5px;font-weight:600;color:var(--muted);margin-top:5px}
+  #convbody .cvchart{margin:10px 0 2px}
+  #convbody .batch{text-align:left;margin-top:6px}
+  #convbody .batch .brow{display:flex;justify-content:space-between;font-size:14px;padding:4px 0;border-top:1px solid #1a2738}
+  #convbody .batch .brow:first-of-type{border-top:none}
+  #convbody .batch .brow .bgain{color:var(--muted)}
+  #convbody .batch .brow.best .bn{color:var(--accent);font-weight:700}
+  #convbody .beff{margin-top:12px;padding-top:12px;border-top:1px solid #1a2738;font-size:13.5px;color:#cdd9e8;line-height:1.45;text-align:left}
+  #convbody .beff b{color:var(--accent)}
+  @media(max-width:720px){#convbody .cvcols{flex-direction:column}}
+  /* "vs CPU" efficiency block (shown on GPU verdicts that have a matching CPU baseline) */
+  #vscpu{display:none;margin:16px auto 0;max-width:640px}
+  #vscpu.show{display:block}
+  #vscpu .vscard{background:#0e1521;border:1px solid #25405d;border-radius:12px;padding:16px 22px;text-align:left}
+  #vscpu .vshead{font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin-bottom:8px}
+  #vscpu .vsbig{font-size:26px;font-weight:800;color:var(--accent);margin-bottom:14px}
+  #vscpu .vsgrid{display:flex;flex-wrap:wrap;gap:12px 30px}
+  #vscpu .vsm{display:flex;flex-direction:column}
+  #vscpu .vsm .vk{font-size:12px;color:var(--muted)}
+  #vscpu .vsm .vv{font-size:16px;font-weight:700;color:#e8eef7}
+  #vscpu .vscaveat{margin-top:14px;font-size:12.5px;color:var(--muted);line-height:1.4}
+  #vscpu .vsnote{background:#0e1521;border:1px solid #25405d;border-radius:12px;padding:14px 20px;font-size:14.5px;color:#cdd9e8;text-align:center}
+  #vscpu .vsnote b{color:var(--accent)}
+  /* streaming verdict signpost → conversion mode (replaces the old re-encode-time panel) */
+  #reconv{display:none;margin:18px auto 0;max-width:560px;font-size:15px;color:var(--muted)}
+  #reconv.show{display:block}
+  #reconv a{color:var(--accent);cursor:pointer;font-weight:600;border-bottom:1px solid rgba(74,163,255,.4)}
+  #reconv a:hover{border-bottom-color:var(--accent)}
+  /* shared throughput-vs-workers curve (live panel + verdict right column).
+     Height is CAPPED and the SVG sizes by height (centred) — a width:100% SVG would grow
+     ~450px tall on a wide panel and push the telemetry off-screen. */
+  .cvchart{width:100%;display:flex;align-items:center;justify-content:center}
+  .cvsvg{height:100%;width:auto;max-width:100%;display:block;overflow:visible}
+  #curvepanel .cvchart{height:190px}
+  #convbody .cvchart{height:150px}
+  .cvaxis{stroke:#25405d;stroke-width:1}
+  .cvline{fill:none;stroke:var(--accent);stroke-width:2.5;stroke-linejoin:round;stroke-linecap:round}
+  .cvdot{fill:var(--accent)}
+  .cvdot.best{fill:#fff;stroke:var(--accent);stroke-width:2}
+  .cvval{fill:#cdd9e8;font-size:10px;text-anchor:middle}
+  .cvval.best{fill:var(--accent);font-weight:700}
+  .cvx{fill:var(--muted);font-size:10px;text-anchor:middle}
+  .cvmeas{fill:none;stroke:var(--accent);stroke-width:2;animation:cvpulse 1s ease-in-out infinite}
+  @keyframes cvpulse{0%,100%{opacity:.25}50%{opacity:1}}
+  #curvepanel .cvhead{display:flex;align-items:baseline;gap:8px;justify-content:center;margin:6px 0 2px}
+  #curvepanel .cvbig{font-size:40px;font-weight:800;color:var(--accent);line-height:1}
+  #curvepanel .cvunit{font-size:15px;color:var(--muted)}
+  #curvepanel .cvsub{text-align:center;color:var(--muted);font-size:13px;min-height:18px;margin-bottom:6px}
+  #curvepanel .cvchart{margin-top:6px}
+  /* busy-GPU warning overlay */
+  #warn{position:fixed;inset:0;display:none;flex-direction:column;align-items:center;justify-content:center;justify-content:safe center;overflow-y:auto;
+    background:radial-gradient(900px 600px at 50% 40%,#2a2410 0%,#0f0c05 70%);z-index:70;text-align:center;padding:40px}
+  #warn.show{display:flex}
+  #warn .accentbar{background:var(--amber)}
+  #warn .cap{font-size:26px;letter-spacing:3px;text-transform:uppercase;color:var(--amber)}
+  /* mid-run cancel: a floating button while a run is in progress + a confirm overlay */
+  #streamspanel{display:flex;flex-direction:column}
+  #cancelrun{display:none;align-self:flex-start;margin-top:auto;
+    font-size:15px;font-weight:700;padding:11px 20px;border-radius:11px;cursor:pointer;
+    color:var(--ink);background:#1a2330;border:1px solid #34465c}
+  #cancelrun:hover{border-color:var(--red);color:var(--red)}
+  #cancelrun.show{display:block}
+  #confirm{position:fixed;inset:0;display:none;flex-direction:column;align-items:center;justify-content:center;
+    background:radial-gradient(900px 600px at 50% 40%,#2a1410 0%,#0f0605 70%);z-index:80;text-align:center;padding:40px}
+  #confirm.show{display:flex}
+  #confirm .cap{font-size:26px;letter-spacing:3px;text-transform:uppercase;color:var(--red)}
+  #confirm .desc{font-size:19px;color:var(--ink);max-width:560px;margin-top:14px}
+  .btnrow{display:flex;gap:14px;flex-wrap:wrap;justify-content:center;margin-top:30px}
+  .bigbtn{font-size:30px;font-weight:800;letter-spacing:1px;padding:20px 56px;
+    border:none;border-radius:14px;cursor:pointer;color:#06140c;background:var(--green);
+    box-shadow:0 8px 30px rgba(46,204,113,.35);transition:transform .1s,box-shadow .2s}
+  .bigbtn:hover{transform:translateY(-2px)} .bigbtn:active{transform:translateY(0)}
+  .bigbtn:disabled{opacity:.45;cursor:default;transform:none;box-shadow:none}
+  .btn2{font-size:17px;font-weight:700;padding:14px 26px;border-radius:11px;cursor:pointer;
+    border:1px solid #2c3e55;background:#16202e;color:var(--ink);transition:border-color .2s,background .2s}
+  .btn2:hover{border-color:var(--accent)}
+  .btn2.primary{background:var(--accent);color:#06140c;border-color:var(--accent)}
+  /* ready screen */
+  /* overlays scroll when content is taller than the window ("safe center" starts at the top
+     instead of clipping it; browsers without `safe` keep plain center as before) */
+  #ready{position:fixed;inset:0;display:none;flex-direction:column;align-items:center;justify-content:center;justify-content:safe center;overflow-y:auto;
+    background:radial-gradient(1000px 700px at 50% 35%,#10243b 0%,#06101c 70%);z-index:60;text-align:center;padding:40px}
+  #ready.show{display:flex}
+  #ready .cap{color:var(--muted);font-size:22px;letter-spacing:4px;text-transform:uppercase}
+  #ready .rtitle{font-size:60px;line-height:1;font-weight:900;letter-spacing:-2px;margin:8px 0 6px}
+  #ready .rdesc{font-size:21px;color:var(--ink)}
+  #ready .rsrc{margin-top:18px;font-size:16px;color:var(--muted)}
+  #ready .rsrc b{color:var(--green)}
+  .picker{display:flex;gap:16px;flex-wrap:wrap;justify-content:center;margin:26px 0 4px;max-width:1000px}
+  .gcard{background:#0e1928;border:2px solid #21405f;border-radius:14px;padding:18px 22px;min-width:210px;
+    cursor:pointer;text-align:center;transition:border-color .2s,background .2s,transform .1s}
+  .gcard:hover{transform:translateY(-2px)}
+  .gcard.sel{border-color:var(--accent);background:rgba(74,163,255,.12);box-shadow:0 0 0 1px var(--accent) inset}
+  .gcard.disabled{opacity:.55;cursor:not-allowed;border-style:dashed}
+  .gcard .gname{font-size:19px;font-weight:700}
+  .gcard .gvendor{font-size:12px;letter-spacing:2px;text-transform:uppercase;color:var(--accent);margin-top:4px}
+  .gcard .gnote{font-size:12px;color:var(--amber);margin-top:8px;max-width:230px}
+  .codecrow{margin:14px 0 4px;color:var(--muted);font-size:15px;display:none;align-items:center;gap:10px}
+  .codecrow select{background:#0e1928;color:var(--ink);border:1px solid #2c3e55;border-radius:9px;
+    padding:9px 14px;font-size:16px;font-weight:700;cursor:pointer}
+  #customrow{display:none;margin:18px auto 0;max-width:560px}
+  #customrow.show{display:block}
+  .customhead{color:var(--muted);font-size:13px;text-transform:uppercase;letter-spacing:1.5px;margin-bottom:8px}
+  .customhead .cmuted{text-transform:none;letter-spacing:0;color:#5d6b80}
+  #customlist{display:flex;flex-direction:column;gap:7px}
+  .cfile{display:flex;align-items:center;justify-content:space-between;gap:12px;cursor:pointer;
+    background:#0e1928;border:1px solid #2c3e55;border-radius:9px;padding:9px 13px;font-size:14px}
+  .cempty{font-size:13px;color:var(--muted);padding:10px 4px;line-height:1.5}
+  .cempty b{color:#cdd9e8}
+  .cfile:hover{border-color:var(--accent)}
+  .cfile.sel{border-color:var(--accent);background:#13233a}
+  .cfile.disabled{opacity:.45;cursor:not-allowed}
+  .cfile .cname{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .cfile .cmeta{color:var(--muted);font-size:12px;white-space:nowrap}
+  .clib{color:var(--amber);font-size:13px;background:#23200d;border:1px solid #4a3f10;
+    border-radius:9px;padding:10px 13px}
+  .codecrow .crlabel{min-width:74px;text-align:right}
+  .subslbl{display:inline-flex;align-items:center;gap:8px;cursor:pointer;color:var(--ink);font-size:15px}
+  .subslbl input{accent-color:#4da3ff;width:16px;height:16px;cursor:pointer}
+  .subslbl .cmuted{color:#5d6b80;font-size:13px}
+  .codecrow .crlabel2{margin-left:6px}
+  .codecrow #sres,.codecrow #tres{min-width:88px}
+  .respart{display:inline-flex;align-items:center;gap:10px}
+  /* streaming mode shows the LOCKED 4K/1080p as static text (no control chrome) for row parity */
+  .resfixed{color:var(--ink);font-weight:700;min-width:88px}
+  /* capability badges on picker cards: per-codec decode/encode marks */
+  .gcaps{display:flex;gap:6px;justify-content:center;margin-top:9px;flex-wrap:wrap}
+  .gcap{font-size:10.5px;letter-spacing:.4px;color:var(--muted);border:1px solid #24364d;border-radius:6px;padding:2px 7px;white-space:nowrap}
+  .gcap .y{color:var(--green)} .gcap .n{color:#5a6a80}
+  /* run history strip on the verdict */
+  #vhistory{display:none;margin:14px auto 0;max-width:640px}
+  #vhistory.show{display:block}
+  #vhistory .hdelta{font-size:17px;font-weight:700;margin-bottom:6px}
+  #vhistory .hdelta.up{color:var(--green)} #vhistory .hdelta.down{color:var(--red)}
+  #vhistory .hdelta .hnote{font-weight:600;font-size:13.5px;color:var(--amber)}
+  #vhistory .hrow{font-size:13px;color:var(--muted);padding:2px 0}
+  #vhistory .hrow b{color:#cdd9e8}
+  #vhistory .hhead{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin-bottom:4px}
+  /* live worst-stream stability sparkline (streaming holds) */
+  .sparkwrap{margin-top:10px;display:none}
+  .sparkwrap.show{display:block}
+  .sparkwrap .sklbl{font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin-bottom:3px}
+  .sparksvg{width:100%;height:84px;display:block}
+  /* non-scaling-stroke keeps the line crisp despite the horizontal stretch (aspect="none") */
+  .sparksvg .skline{fill:none;stroke:var(--accent);stroke-width:1.8;vector-effect:non-scaling-stroke}
+  .sparksvg .skmark{stroke:var(--amber);stroke-width:1;stroke-dasharray:4 3;vector-effect:non-scaling-stroke}
+  .sparksvg .skfill{fill:var(--accent);opacity:.10}
+  /* tap/click tooltip popover (title= is invisible on touch) */
+  #tipbox{position:absolute;display:none;max-width:320px;background:#141f33;border:1px solid #2c4562;border-radius:10px;padding:10px 14px;font-size:13px;line-height:1.45;color:#cdd9e8;z-index:99;box-shadow:0 8px 24px rgba(0,0,0,.5)}
+  [title]{cursor:help}
+  /* test-all batch: button + comparison table */
+  #allbtn{display:block;margin:10px auto 0;background:none;border:1px solid #2c3e55;color:var(--muted);border-radius:10px;padding:9px 18px;font-size:14.5px;cursor:pointer}
+  #allbtn:hover{border-color:var(--accent);color:var(--ink)}
+  #batchprog{font-size:13px;color:var(--amber);margin-top:6px}
+  #batchbody{display:none;margin:14px auto 0;max-width:720px}
+  #batchbody.show{display:block}
+  #batchbody .btable{background:#0e1521;border:1px solid #25405d;border-radius:12px;padding:14px 20px;text-align:left}
+  #batchbody .btr{display:flex;justify-content:space-between;gap:14px;font-size:15px;padding:7px 0;border-top:1px solid #1a2738;align-items:baseline}
+  #batchbody .btr:first-of-type{border-top:none}
+  #batchbody .btr .bdev{flex:1;font-weight:700;color:#e8eef7}
+  #batchbody .btr.best .bdev{color:var(--accent)}
+  #batchbody .btr .bcell{color:#cdd9e8;white-space:nowrap}
+  #batchbody .btr .bcell small{color:var(--muted)}
+  #batchbody .btr.skip .bdev,#batchbody .btr.skip .bcell{color:var(--muted);font-weight:600}
+  #batchbody .bth{display:flex;justify-content:space-between;gap:14px;font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);padding-bottom:6px}
+  #batchbody .bth span:first-child{flex:1}
+  /* flex:none is LOAD-BEARING: as a flex item of the #ready column, overflow:hidden removes
+     the min-content floor, so when the screen's content outgrows the viewport (e.g. the custom
+     file list appears) the toggle is the one element allowed to shrink — Safari collapses it
+     to a 2px line. Never let it shrink. */
+  .modetoggle{display:inline-flex;flex:none;margin:4px 0 10px;border:1px solid #2c3e55;border-radius:12px;overflow:hidden;background:#0e1928}
+  .modebtn{background:none;border:none;color:var(--muted);font-size:15px;font-weight:700;padding:10px 24px;cursor:pointer;transition:background .15s,color .15s}
+  .modebtn:hover{color:var(--ink)}
+  .modebtn.active{background:var(--accent);color:#06140c}
+  #advnote{font-size:13px;color:var(--muted);max-width:520px;text-align:center;margin:14px auto 18px}
+  #advnote .local{color:var(--amber)}
+</style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>GPU Transcode Benchmark</h1>
+      <div class="hwline" id="hwline"></div>
+    </div>
+    <div class="profile"><b id="sreslbl">4K</b> <b id="inlbl">HEVC</b>&nbsp;→&nbsp;<b id="treslbl">1080p</b> · <b id="codeclbl">H.264</b> · <b id="bitrate">8M</b> · <b id="encoder">—</b></div>
+  </header>
+
+  <div class="top">
+    <div class="panel" id="streamspanel">
+      <div class="label" id="streamslabel">Streams</div>
+      <div class="streams-num" id="streams">0</div>
+      <div class="sub" id="predict"></div>
+      <div id="batchprog"></div>
+      <button id="cancelrun" onclick="askCancel()">✕ Cancel run</button>
+    </div>
+
+    <div class="panel" id="streampanel">
+      <div class="label">Worst stream speed (× realtime)</div>
+      <div class="gauge" id="gauge"><div class="val" id="minspeed">—</div><div class="x">×</div></div>
+      <div class="meterwrap">
+        <div class="meter"><div class="line"></div><div class="fill" id="fill"></div></div>
+        <div class="meter-legend"><span>0×</span><span>1.0× realtime</span><span>2×+</span></div>
+      </div>
+      <div class="small-stats">
+        <div><span class="k">Average</span><span class="v" id="avgspeed">—</span></div>
+        <div><span class="k">Combined</span><span class="v" id="combined">—</span></div>
+        <div><span class="k">Pass mark</span><span class="v" id="thresh">—</span></div>
+      </div>
+      <div class="sparkwrap" id="sparkwrap"><div class="sklbl">Worst-stream stability</div>
+        <div id="sparkchart"></div></div>
+    </div>
+
+    <div class="panel" id="curvepanel" style="display:none">
+      <div class="label">Throughput vs workers</div>
+      <div class="cvhead"><span class="cvbig" id="cvcombined">—</span><span class="cvunit">× combined</span></div>
+      <div class="cvsub" id="cvsub"></div>
+      <div class="cvchart" id="cvchartlive"></div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="label">Per-stream</div>
+    <div class="cards" id="cards"></div>
+    <div class="label" style="margin-top:20px">GPU telemetry</div>
+    <div class="tele" id="tele"></div>
+    <div class="status" id="status"></div>
+  </div>
+
+  <div id="ready">
+    <div class="cap">GPU Transcode Benchmark</div>
+    <div class="rtitle" id="rtitle">Choose a GPU to test</div>
+    <div class="modetoggle">
+      <button class="modebtn" data-mode="streaming" onclick="selectMode('streaming')">How many streams</button>
+      <button class="modebtn" data-mode="convert" onclick="selectMode('convert')">How fast it converts</button>
+    </div>
+    <div class="rdesc" id="rdesc">4K&nbsp;→&nbsp;1080p · <b id="rbitrate">8M</b> · strict ≥ 1.0× realtime</div>
+    <div class="picker" id="picker"></div>
+    <div class="codecrow" id="inputrow"><span class="crlabel">Source</span>
+      <select id="inputc" onchange="selectInput(this.value)"></select>
+      <b class="resfixed" id="inputfixed" style="display:none"></b>
+      <span class="respart" id="srespart"><span class="crlabel2">Resolution</span>
+        <select id="sres" onchange="selectSourceRes(this.value)"></select>
+        <b class="resfixed" id="sresfixed">4K</b></span>
+    </div>
+    <div class="codecrow" id="codecrow"><span class="crlabel">Output</span>
+      <select id="codec" onchange="selectCodec(this.value)"></select>
+      <span class="respart" id="trespart"><span class="crlabel2">Resolution</span>
+        <select id="tres" onchange="selectTargetRes(this.value)"></select>
+        <b class="resfixed" id="tresfixed">1080p</b></span>
+    </div>
+    <div class="codecrow" id="subsrow" style="display:none"><span class="crlabel">Subtitles</span>
+      <label class="subslbl" title="Burns a shipped subtitle track into every stream (libass render, like PGS/ASS burn-in on Plex or Jellyfin) — the frames must leave the GPU, get composited on the CPU and come back, which is exactly what makes burn-in expensive on a real server. Same subtitles for everyone, so the result stays comparable as its own leaderboard profile.">
+        <input type="checkbox" id="subschk" onchange="selectSubs(this.checked)"> burn in subtitles
+        <span class="cmuted" id="subsnote"></span>
+      </label>
+    </div>
+    <div id="advnote"></div>
+    <div id="customrow">
+      <div class="customhead">Or test your own file <span class="cmuted">— local only, not comparable</span></div>
+      <div id="customlist"></div>
+    </div>
+    <button class="bigbtn" id="startbtn" onclick="start()">▶ START</button>
+    <button id="allbtn" onclick="startAll()" title="Runs the same test on every capable device (GPUs + CPU) one after another, then shows a side-by-side comparison. Make sure the GPUs are idle — the busy check is skipped in a batch.">⚡ Test all devices</button>
+    <div class="rsrc" id="rsrc"></div>
+  </div>
+
+  <div id="warn">
+    <div class="accentbar"></div>
+    <div class="cap" id="warncap">⚠ GPU in use</div>
+    <div class="desc" id="warndesc"></div>
+    <div class="specs" id="warnapps"></div>
+    <div class="foot">For an accurate result, stop the other GPU apps first — then continue.</div>
+    <div class="btnrow">
+      <button class="btn2" onclick="cancelRun()">Cancel</button>
+      <button class="bigbtn" style="font-size:20px;padding:14px 30px" onclick="continueRun()">Continue anyway</button>
+    </div>
+  </div>
+
+  <div id="confirm">
+    <div class="cap">Cancel this run?</div>
+    <div class="desc">This stops the test and returns to the GPU picker. No result is saved.</div>
+    <div class="btnrow">
+      <button class="btn2" onclick="dismissCancel()">Keep running</button>
+      <button class="bigbtn" style="font-size:20px;padding:14px 30px;background:var(--red);color:#fff" onclick="abortRun()">Yes, cancel</button>
+    </div>
+  </div>
+
+  <div id="verdict">
+    <div class="accentbar"></div>
+    <div class="cap" id="vcap">Max sustained</div>
+    <div class="n" id="vnum">—</div>
+    <div class="desc" id="vdesc"></div>
+    <div class="foot" id="vfoot"></div>
+    <div id="batchbody"></div>
+    <div id="convbody"></div>
+    <div id="vscpu"></div>
+    <div id="vhistory"></div>
+    <div class="eff" id="veff"></div>
+    <div class="insight" id="vinsight"></div>
+    <div id="reconv">Re-encoding a library instead? <a onclick="goConvert()">How fast it converts</a> gives per-file times for any codec.</div>
+    <div class="specs" id="vspecs"></div>
+    <div class="btnrow">
+      <button class="btn2" id="copybtn" onclick="copyResult()">⧉ Copy result</button>
+      <button class="btn2" id="pngbtn" onclick="downloadCard()">⭳ Save card (PNG)</button>
+      <button class="btn2 primary" id="submitbtn" onclick="submitResult()" style="display:none">⇪ Submit to database</button>
+      <a class="btn2" id="boardbtn" target="_blank" rel="noopener" style="display:none;text-decoration:none">🏆 View leaderboard</a>
+      <button class="bigbtn" id="againbtn" onclick="reset()" style="font-size:20px;padding:14px 30px">↻ Run Again</button>
+    </div>
+    <div id="suberr"></div>
+  </div>
+
+<script>
+const VENDOR_COLORS = {intel:"#2aa3ff", nvidia:"#76b900", amd:"#ed1c24", cpu:"#9aa7bd"};
+const CODEC_LABEL = {h264:"H.264", hevc:"HEVC (H.265)", av1:"AV1", hdr:"HDR10 (HEVC)"};
+let LAST = {};
+function fmt(x){ return (x==null||isNaN(x)) ? "—" : Number(x).toFixed(2); }
+function drvStr(o){ return [...new Set([o.driver, o.kernel_driver].filter(Boolean))].join(" · "); }
+function applyAccent(vendor){
+  const c = VENDOR_COLORS[vendor] || "#4aa3ff";
+  document.documentElement.style.setProperty("--accent", c);
+}
+
+async function tick(){
+  let s;
+  try{ s = await (await fetch("/state.json",{cache:"no-store"})).json(); }
+  catch(e){ return; }
+  LAST = s;
+
+  // theme accent: running/done use s.vendor; idle uses the selected GPU's vendor
+  let vendor = s.vendor;
+  if(!vendor && s.selected_idx!=null){
+    const g = (s.gpus||[]).find(x=>x.idx===s.selected_idx); if(g) vendor = g.vendor;
+  }
+  applyAccent(vendor);
+
+  document.getElementById("bitrate").textContent = s.bitrate || "—";
+  document.getElementById("encoder").textContent = s.encoder || "—";
+  document.getElementById("codeclbl").textContent = (CODEC_LABEL[s.selected_codec] || "H.264")
+    + ((["hevc","av1"].indexOf(s.selected_input)>=0 && s.selected_target_res===s.selected_source_res
+        && ["hevc","av1"].indexOf(s.selected_codec)>=0) ? " 10-bit" : "");
+  document.getElementById("inlbl").textContent = (s.selected_input || "hevc").toUpperCase();
+  document.getElementById("sreslbl").textContent = (RES_LABEL[s.selected_source_res]||"4K");
+  document.getElementById("treslbl").textContent = (RES_LABEL[s.selected_target_res]||"1080p");
+  document.getElementById("streams").textContent = s.stream_count ?? 0;
+  document.getElementById("thresh").textContent  = fmt(s.threshold)+"×";
+  document.getElementById("avgspeed").textContent = fmt(s.avg_speed)+"×";
+  document.getElementById("combined").textContent = fmt(s.combined_speed)+"×";
+  document.getElementById("status").textContent  = s.message || "";
+
+  // hardware line: vendor chip + GPU name; CPU & RAM for the Intel iGPU; driver
+  const hw = document.getElementById("hwline");
+  let h = "";
+  if(vendor) h += '<span class="vchip"><span class="dot"></span>'+vendor+'</span>';
+  if(s.selected_name) h += '<b>'+s.selected_name+'</b>';
+  const drvh = drvStr(s); if(drvh) h += ' · drv '+drvh;
+  if(s.is_igpu && s.cpu) h += ' · '+s.cpu;
+  if((s.is_igpu || s.vendor==="cpu") && s.ram_speed) h += ' · RAM '+s.ram_speed+(s.ram_hint?' <span class="warn">('+s.ram_hint+')</span>':'');
+  hw.innerHTML = h;
+
+  // live estimate tracks measured aggregate throughput
+  const predict = document.getElementById("predict");
+  if(s.projected) predict.textContent = "measured throughput ≈ "+s.projected+" streams' worth of real-time";
+  else if(s.single_stream_speed) predict.textContent = "1 stream at "+fmt(s.single_stream_speed)+"× — measuring throughput…";
+  else predict.textContent = "";
+  if(s.ui==="running" && s.hold_seconds)   // per-level ETA so the run length isn't a mystery
+    predict.textContent += (predict.textContent?" · ":"")
+      +"≈"+Math.round((s.settle_seconds||0)+(s.hold_seconds||0)+4)+"s per level";
+  if(s.ui==="running" && s.vram_note)      // dGPU: live per-stream VRAM cost + predicted wall
+    predict.textContent += (predict.textContent?" · ":"")+s.vram_note;
+  document.getElementById("batchprog").textContent =
+    (s.batch && (s.ui==="running"||s.ui==="preparing") && (s.batch_queue||[]).length)
+      ? ("Device "+Math.min((s.batch_done||0)+1,(s.batch_queue||[]).length)+" of "+s.batch_queue.length+" — "+(s.batch_queue[Math.min(s.batch_done||0, s.batch_queue.length-1)]||""))
+      : "";
+
+  // stability sparkline: worst-stream speed across the current level (streaming runs only)
+  const sparkOn = (s.ui==="running") && (s.selected_mode||"streaming")==="streaming";
+  if(sparkOn){
+    if(SPARK.n !== s.stream_count){ SPARK.n = s.stream_count; SPARK.pts = []; }
+    if(s.min_speed!=null) SPARK.pts.push(s.min_speed);
+    if(SPARK.pts.length>150) SPARK.pts.shift();
+    document.getElementById("sparkchart").innerHTML = sparkSvg(SPARK.pts, s.threshold||1);
+  } else { SPARK.pts = []; SPARK.n = -1; }
+  document.getElementById("sparkwrap").classList.toggle("show", sparkOn && SPARK.pts.length>1);
+
+  // headline gauge = worst (min) stream speed
+  const mn = s.min_speed;
+  const gauge = document.getElementById("gauge");
+  document.getElementById("minspeed").textContent = fmt(mn);
+  const fill = document.getElementById("fill");
+  fill.style.width = Math.max(0, Math.min(100, (mn||0)/2*100))+"%";
+  const ok = (mn!=null) && (mn >= (s.threshold||1.0));
+  gauge.className = "gauge " + (mn==null ? "" : ok ? "ok":"bad");
+  fill.style.background = ok ? "var(--green)" : "var(--red)";
+
+  // convert mode uses a throughput-vs-workers curve instead of the 1.0×-realtime gauge
+  const convLive = (s.selected_mode === "convert");
+  document.getElementById("streampanel").style.display = convLive ? "none" : "";
+  document.getElementById("curvepanel").style.display = convLive ? "" : "none";
+  document.getElementById("streamslabel").textContent = convLive ? "Workers" : "Streams";
+  if(convLive){
+    const cur = s.combined_speed;
+    document.getElementById("cvcombined").textContent = (cur!=null ? fmt(cur) : "—");
+    document.getElementById("cvsub").textContent = s.single_stream_speed
+      ? "per file "+fmt(s.single_stream_speed)+"× realtime"
+      : (s.conv_testing_n ? "measuring worker 1…" : "");
+    document.getElementById("cvchartlive").innerHTML =
+      curveSvg(s.conv_levels||[], s.conv_testing_n, null);
+  }
+
+  // per-stream cards
+  const wrap = document.getElementById("cards");
+  const holding = s.phase === "holding";
+  wrap.innerHTML = "";
+  (s.streams||[]).forEach(st=>{
+    const c = document.createElement("div");
+    const good = (st.pass !== undefined) ? st.pass : (st.speed >= 1.0);  // convert mode: moving = healthy
+    c.className = "card " + (good ? "ok" : "bad") + ((!good && holding) ? " flash":"");
+    c.innerHTML = '<div class="id">STREAM '+st.id+'</div><div class="spd">'+fmt(st.speed)+
+                  '×</div><div class="fps">'+fmt(st.fps)+' fps</div>';
+    wrap.appendChild(c);
+  });
+
+  renderTelemetry(s);
+  renderScreens(s, vendor);
+}
+
+function teleChip(k,v,accent,title){
+  return '<div class="t'+(accent?' accent':'')+'"'+(title?' title="'+title+'"':'')+
+         '><div class="tk">'+k+'</div><div class="tv">'+v+'</div></div>';
+}
+function renderTelemetry(s){
+  const t = s.telemetry || {}; const out = [];
+  // engine load (the star metric)
+  if(t.enc!=null) out.push(teleChip("Encoder", Math.round(t.enc)+"%", true));
+  if(t.dec!=null) out.push(teleChip("Decoder", Math.round(t.dec)+"%"));
+  if(t.engines){ Object.entries(t.engines).forEach(([n,b])=>{
+    if(/Video/.test(n)) out.push(teleChip(n, fmt(b)+"%", /Video$/.test(n))); }); }
+  if(t.enc==null && !t.engines && t.util!=null) out.push(teleChip("Util", Math.round(t.util)+"%", true));
+  if(t.clock!=null) out.push(teleChip("Clock", Math.round(t.clock)+" MHz"));
+  // power: real (dGPU) or estimated (iGPU package-delta)
+  if(s.power_estimated && t.power_pkg!=null)
+    out.push(teleChip("Power (est.)", Math.round(t.power_pkg)+" W", true,
+      "iGPU has no power sensor. Estimated from CPU-package power under load vs idle; "+
+      "includes some CPU overhead and assumes an otherwise-idle box. Rough figure."));
+  else if(t.power!=null) out.push(teleChip("Power", Math.round(t.power)+" W", true));
+  else if(t.power_pkg!=null) out.push(teleChip("Pkg power", Math.round(t.power_pkg)+" W"));
+  if(t.temp!=null) out.push(teleChip("Temp", Math.round(t.temp)+"°C"));
+  if(t.throttle) out.push(teleChip("Throttle", "YES"));
+  if(s.streams_per_watt!=null)
+    out.push(teleChip("Streams/W"+(s.power_estimated?" (est.)":""), fmt(s.streams_per_watt), true,
+      s.power_estimated ? "Based on the estimated iGPU power — rough." : ""));
+  document.getElementById("tele").innerHTML = out.join("") ||
+    '<div class="t"><div class="tk">telemetry</div><div class="tv">—</div></div>';
+}
+
+function renderScreens(s, vendor){
+  const ui = s.ui || "idle";
+  const ready = document.getElementById("ready");
+  const v = document.getElementById("verdict");
+
+  if(ui === "idle"){
+    ready.classList.add("show");
+    renderMode(s);
+    renderPicker(s);
+    renderInput(s);
+    renderCodec(s);
+    renderSubs(s);
+    renderCustom(s);
+    renderNote(s);
+    const gpus = s.gpus || [];
+    const hasAvail = gpus.some(g => g.available);
+    document.getElementById("rtitle").textContent = hasAvail ? "Choose a GPU to test" : "No testable GPU found";
+    document.getElementById("startbtn").style.display = hasAvail ? "" : "none";
+    document.getElementById("startbtn").disabled = (s.selected_idx == null);
+    // test-all only makes sense with 2+ devices and shipped clips (a custom file can't be
+    // decoded everywhere, so the comparison wouldn't be apples-to-apples)
+    document.getElementById("allbtn").style.display =
+      (hasAvail && !s.selected_custom && gpus.filter(g=>g.available).length>1) ? "" : "none";
+    document.getElementById("rsrc").innerHTML = !hasAvail
+      ? "Pass <b>/dev/dri</b> (Intel/AMD) and/or add <b>--runtime=nvidia</b> (NVIDIA)."
+      : (s.selected_custom
+          ? "A 60-second sample from your file is loaded into RAM."
+          : "A sample clip is loaded into RAM — so it measures the GPU, not your disk.");
+  } else ready.classList.remove("show");
+
+  const warn = document.getElementById("warn");
+  if(ui === "warn"){
+    warn.classList.add("show");
+    document.getElementById("warncap").textContent = (s.vendor==="cpu") ? "⚠ CPU in use" : "⚠ GPU in use";
+    document.getElementById("warndesc").textContent =
+      "This "+(s.vendor==="cpu"?"CPU":"GPU")+" looks busy (~"+Math.round(s.busy_load||0)+"% load) before the test.";
+    document.getElementById("warnapps").textContent =
+      (s.busy_apps && s.busy_apps.length) ? ("Active: "+s.busy_apps.join(", "))
+      : (s.busy_named ? "" : "Add --pid=host to name the apps using this GPU.");
+  } else warn.classList.remove("show");
+
+  if(ui === "done"){
+    const r = s.result || {};
+    const capped = s.cap_reason === "session";
+    const inC = r.input_codec || s.selected_input || "hevc";
+    const srcL = CODEC_LABEL[inC] || inC.toUpperCase();
+    const outL = (CODEC_LABEL[r.codec] || (r.codec||"h264").toUpperCase()) + (r.ten_bit ? " 10-bit" : "");
+    const srcRes = RES_LABEL[r.source_res] || "4K", tgtRes = RES_LABEL[r.target_res] || "1080p";
+    const srcPart = r.custom_source ? (srcL+" (your file)") : (srcRes+" "+srcL);
+    const prof = srcPart + " → " + tgtRes + " " + outL
+      + (inC==="hdr" ? " (tone-mapped)" : "") + (r.subs_burn ? " + subs burned in" : "");
+    v.classList.add("show");
+    const batch = !!(s.batch && (s.batch_results||[]).length);
+    document.getElementById("batchbody").classList.toggle("show", batch);
+    document.getElementById("copybtn").style.display = batch ? "none" : "";
+    document.getElementById("pngbtn").style.display = batch ? "none" : "";
+    if(batch){
+      // TEST-ALL verdict: the comparison table IS the result — hide the single-run furniture
+      v.classList.remove("fail");
+      document.getElementById("vcap").style.display = "";
+      document.getElementById("vcap").textContent = "Device comparison";
+      document.getElementById("vnum").style.display = "none";
+      document.getElementById("vdesc").innerHTML = prof+" — "+s.batch_results.length+" device"+(s.batch_results.length>1?"s":"");
+      document.getElementById("vfoot").textContent = "The same test on every capable device, one after another. ★ = fastest.";
+      document.getElementById("veff").innerHTML = "";
+      document.getElementById("vinsight").style.display = "none";
+      document.getElementById("vspecs").innerHTML = (r.os_version?("Unraid <b>"+r.os_version+"</b>"):"")+(r.kernel?(" · kernel "+r.kernel):"");
+      document.getElementById("submitbtn").style.display = "none";
+      document.getElementById("convbody").classList.remove("show");
+      document.getElementById("vscpu").className = "";
+      document.getElementById("vhistory").className = "";
+      document.getElementById("reconv").classList.remove("show");
+      document.getElementById("suberr").className = "";
+      renderBatch(s);
+      return _doneTail(ui);
+    }
+    document.getElementById("veff").innerHTML = effBlock(r);
+    document.getElementById("vinsight").textContent = r.power_insight || "";
+    document.getElementById("vinsight").style.display = r.power_insight ? "" : "none";
+    document.getElementById("vspecs").innerHTML = specLine(s);
+    const sb = document.getElementById("submitbtn");
+    sb.style.display = (s.submit_url_set && r.comparable) ? "" : "none";
+    sb.disabled = !!s.submitted;
+    sb.textContent = s.submitted ? "✓ Submitted" : "⇪ Submit to database";
+    const bb = document.getElementById("boardbtn");     // appears once THIS result is on the board
+    bb.style.display = (s.submitted && s.board_url) ? "" : "none";
+    if(s.board_url) bb.href = s.board_url;
+    const conv = (r.mode === "convert");
+    document.getElementById("convbody").classList.toggle("show", conv);
+    if(conv){
+      // CONVERSION verdict: two co-equal panels (speed | workers). No giant centre number —
+      // each panel carries its own headline, so the header is just the GPU + profile.
+      v.classList.remove("fail");
+      document.getElementById("vcap").style.display = "none";
+      document.getElementById("vnum").style.display = "none";
+      document.getElementById("vdesc").innerHTML = "<b>"+escHtml(s.selected_name)+"</b> — "+prof;
+      document.getElementById("vfoot").textContent = "";
+      document.getElementById("reconv").classList.remove("show");
+      renderConvBody(s, r);
+    } else {
+      // STREAMING verdict (max simultaneous)
+      document.getElementById("vcap").style.display = "";
+      document.getElementById("vnum").style.display = "";
+      const n = s.confirmed_max ?? 0;
+      const local = (r.comparable === false) ? ' <span style="color:var(--amber)">· local only</span>' : '';
+      document.getElementById("vcap").textContent = "Max sustained";
+      v.classList.toggle("fail", n === 0 && !capped);
+      // the big number is ALWAYS the measured sustained count — projections are throughput
+      // statements, never session counts (the patched-5090 experiment proved sessions wall
+      // on VRAM long before engine throughput runs out)
+      document.getElementById("vnum").textContent = n;
+      if(capped){
+        const lr = r.limit_reason || "session";
+        const thr = (s.projected_uncapped ?? r.projected);
+        const thrTxt = thr ? " Engine throughput ≈"+thr+"× realtime — headroom the sessions can't reach." : "";
+        let how, foot;
+        if(lr === "memory"){
+          const gb = r.vram_per_session_mb ? (r.vram_per_session_mb/1024).toFixed(1) : null;
+          how = " hit its VRAM ceiling at "+n+" streams ("+prof+")."
+            + (gb ? " Each stream holds ~"+gb+" GB of video memory" : "")
+            + (r.vram_clean_ceiling ? " — an otherwise-empty card could reach ~"+r.vram_clean_ceiling+"." : ".");
+          foot = "Every 4K session reserves decode/scale/encode buffers in VRAM; the card filled up before the encoders did."+thrTxt;
+        } else if(lr === "unknown"){
+          how = " stopped at "+n+" streams ("+prof+") — a stream failed to start for an unrecognised reason.";
+          foot = "Not a throughput failure (the running streams still had headroom), and neither the driver session cap nor the VRAM prediction explains it."+thrTxt;
+        } else {
+          how = " hit the driver's NVENC session limit at "+n+" streams ("+prof+").";
+          foot = "Consumer NVIDIA drivers cap concurrent NVENC sessions ("+n+" here). The cap is a driver limit, not the silicon."+thrTxt;
+        }
+        document.getElementById("vdesc").innerHTML = escHtml(s.selected_name)+how+local;
+        document.getElementById("vfoot").textContent = foot;
+      } else {
+        document.getElementById("vdesc").innerHTML =
+          escHtml(s.selected_name)+" — throughput equivalent of ~"+n+" simultaneous "+srcPart+" → "+(r.bitrate||"")+" "+tgtRes+" "+outL+" streams"+local;
+        document.getElementById("vfoot").textContent =
+          "Measured flat-out throughput ÷ realtime. A conservative ceiling, not a guaranteed concurrent-playback count.";
+      }
+      document.getElementById("reconv").classList.add("show");   // signpost to conversion mode
+    }
+    renderVsCpu(r);
+    renderHistory(s);
+    const se = document.getElementById("suberr");
+    const seMsg = /^Submit (failed|rejected)/.test(s.message||"") ? s.message : "";
+    se.textContent = seMsg; se.className = seMsg ? "show" : "";
+  } else if(ui === "error"){
+    v.classList.add("show","fail");
+    document.getElementById("vnum").style.display = "";
+    document.getElementById("vnum").textContent = "✕";
+    document.getElementById("vdesc").textContent = s.message || "error";
+    document.getElementById("vfoot").textContent = "";
+    document.getElementById("vspecs").textContent = "";
+    document.getElementById("submitbtn").style.display = "none";
+  } else v.classList.remove("show");
+  _doneTail(ui);
+}
+
+function _doneTail(ui){
+  if(ui !== "done"){   // collapse + hide the verdict-only panels off the verdict screen
+    document.getElementById("vscpu").className = "";
+    document.getElementById("vhistory").className = "";
+    document.getElementById("batchbody").classList.remove("show");
+    document.getElementById("reconv").classList.remove("show");
+    document.getElementById("suberr").className = "";
+  }
+  // mid-run cancel button: visible only while a run is actually in progress
+  const inRun = (ui === "preparing" || ui === "running");
+  document.getElementById("cancelrun").classList.toggle("show", inRun);
+  if(!inRun) dismissCancel();   // run ended/cancelled — drop any open confirm dialog
+}
+
+const TIP_EFF_DGPU = "Watts per stream at full load (total board power divided by throughput). Lower is better. A discrete GPU only reaches good efficiency under heavy load.";
+const TIP_EFF_IGPU = "Estimated watts per stream — the iGPU has no power sensor, so this is the rise in CPU-package power under load divided by throughput. Rough figure.";
+const TIP_EFF_CPU  = "Watts per stream of throughput — the rise in CPU package power under load vs idle, divided by combined throughput. Lower is better.";
+const TIP_EFF_CONV = "Energy per hour of converted video: full-load watts divided by combined throughput (e.g. 35× realtime = 35 hours of video per hour of wall time). Lower is better. This is the honest per-file energy cost — no realtime streams exist in a conversion run.";
+const TIP_PWR_DGPU = "A discrete GPU jumps to a high power state to transcode anything, then each extra stream adds little. Most of the draw is fixed overhead, so it is only power-efficient running many streams — or when the card is already busy with other work.";
+const TIP_PWR_IGPU = "The iGPU has no isolated power sensor. This is the rise in CPU-package power (CPU+GPU) under load vs idle. The iGPU's own draw is tiny — great for light or always-on transcoding.";
+const TIP_PWR_CPU  = "The rise in CPU package power while software-transcoding, vs idle. Software encoding keeps every core busy, so this is usually far more power than a GPU media engine doing the same job.";
+
+function movieWh(wps){
+  // 1.5 hr movie energy: sub-10 keeps a decimal ("≈6.9 Wh"), bigger rounds whole
+  const v = wps * 1.5;
+  return v >= 10 ? Math.round(v) : Math.round(v*10)/10;
+}
+function effBlock(r){
+  if(!r) return "";
+  const est = r.power_estimated, cpu = r.is_cpu, conv = r.mode === "convert";
+  // RAPL package power is a real measurement — only hedge with "(est.)" when it isn't (iGPU
+  // keeps the hedge regardless: the package delta still blends in some CPU feeding-overhead)
+  const hedge = est && !(cpu && r.power_rapl);
+  let out = "";
+  if(r.watts_per_stream!=null){
+    // convert mode has NO streams — "W / stream" invites reading it as per-WORKER power (off by
+    // >10×). Same number, honest clothes: watts ÷ combined-×realtime IS Wh per hour of video.
+    out += conv
+      ? '<span class="effmain" title="'+TIP_EFF_CONV+'">≈'+r.watts_per_stream+' Wh per hour of video converted'+(hedge?' (est.)':'')+'</span>'
+        + ' &nbsp;·&nbsp; a 1.5 hr movie ≈ '+movieWh(r.watts_per_stream)+' Wh'
+      : '<span class="effmain" title="'+(cpu?TIP_EFF_CPU:est?TIP_EFF_IGPU:TIP_EFF_DGPU)+'">≈'+r.watts_per_stream+' W / stream'+(hedge?' (est.)':'')+'</span>';
+  }
+  if(!conv && r.streams_per_watt!=null) out += ' &nbsp;·&nbsp; '+r.streams_per_watt+' streams/W';
+  let pl = "";
+  if(est){
+    if(r.peak_power_w!=null)
+      pl = '<span title="'+(cpu?TIP_PWR_CPU:TIP_PWR_IGPU)+'">'+(cpu?'CPU transcoding adds':'iGPU adds')+' ~<b>'+Math.round(r.peak_power_w)+' W</b> under load'+(hedge?' (est.)':'')+'</span>';
+  } else {
+    const parts = [];
+    if(r.idle_power_w!=null) parts.push('idle <b>'+Math.round(r.idle_power_w)+' W</b>');
+    if(r.one_stream_power_w!=null) parts.push((conv?'1 worker':'1 stream')+' <b>'+Math.round(r.one_stream_power_w)+' W</b>');
+    if(r.load_power_w!=null) parts.push('full load <b>'+Math.round(r.load_power_w)+' W</b>');
+    if(parts.length) pl = '<span title="'+TIP_PWR_DGPU+'">Power: '+parts.join(' → ')+'</span>';
+  }
+  return '<div class="effrow">'+out+'</div>'+(pl?'<div class="pwrrow">'+pl+'</div>':'');
+}
+
+function specLine(s){
+  const r = s.result || {}; const bits = [];
+  if(r.is_cpu){
+    // CPU runs: the levers that actually explain the result — encoder+preset, threads, RAM+XMP
+    bits.push("encoder <b>"+(r.cpu_encoder||"software")+" · "+(r.cpu_preset||"")+"</b>");
+    if(r.cpu) bits.push(r.cpu + (r.cpu_threads?" (<b>"+r.cpu_threads+" threads</b>)":""));
+    if(s.ram_speed) bits.push("RAM <b>"+s.ram_speed+"</b>"+(s.ram_hint?' <span class="warn">('+s.ram_hint+')</span>':''));
+  } else {
+    const drv = drvStr(r); if(drv) bits.push("driver <b>"+drv+"</b>");
+    if(s.is_igpu && s.ram_speed) bits.push("RAM <b>"+s.ram_speed+"</b>"+(s.ram_hint?' <span class="warn">('+s.ram_hint+')</span>':''));
+    if(r.cpu) bits.push(r.cpu);
+  }
+  if(r.os_version) bits.push("Unraid <b>"+r.os_version+"</b>");
+  if(r.kernel) bits.push("kernel "+r.kernel);
+  return bits.join(" · ");
+}
+
+function renderPicker(s){
+  const p = document.getElementById("picker");
+  const gpus = s.gpus || [];
+  const sig = JSON.stringify(gpus.map(g=>[g.idx,g.available]))+"|"+s.selected_idx;
+  if(p.dataset.sig === sig) return;
+  p.dataset.sig = sig; p.innerHTML = "";
+  gpus.forEach(g => {
+    const c = document.createElement("div");
+    c.className = "gcard" + (g.idx===s.selected_idx ? " sel":"") + (g.available ? "" : " disabled");
+    if(g.idx===s.selected_idx){ const col=VENDOR_COLORS[g.vendor]||"#4aa3ff";
+      c.style.borderColor=col; c.style.boxShadow="0 0 0 1px "+col+" inset"; }
+    let html = '<div class="gname">'+escHtml(g.name)+'</div><div class="gvendor">'+escHtml(g.vendor)+' · '+escHtml(g.api)+'</div>';
+    if(g.note) html += '<div class="gnote">'+escHtml(g.note)+'</div>';
+    if(g.available) html += capBadges(g);
+    c.innerHTML = html;
+    if(g.available) c.onclick = () => select(g.idx);
+    p.appendChild(c);
+  });
+}
+
+const RES_LABEL = {"4k":"4K","1080p":"1080p","720p":"720p"};
+function fillSel(id, opts, selected, labelFn){
+  const sel = document.getElementById(id);
+  const sig = opts.join(",")+"|"+selected;
+  if(sel.dataset.sig !== sig){
+    sel.dataset.sig = sig;
+    sel.innerHTML = opts.map(o=>'<option value="'+o+'"'+(o===selected?' selected':'')+'>'+labelFn(o)+'</option>').join("");
+  }
+}
+function srcCodecs(s, g){
+  // source codecs = what the GPU can hw-decode AND what we ship at the chosen source resolution
+  const sr = s.selected_source_res || "4k";
+  const shipped = (s.source_codecs_by_res||{})[sr] || ["h264"];
+  return (g && g.decodes ? g.decodes : []).filter(c => shipped.indexOf(c) >= 0);
+}
+function resFromWH(res){
+  // "3840x2160" → "4K" / "1080p" / "<h>p" — display label for a custom file's resolution
+  const h = parseInt((res||"").split("x")[1]||0, 10);
+  if(!h) return "";
+  return h >= 2000 ? "4K" : h >= 1000 ? "1080p" : h+"p";
+}
+function renderInput(s){
+  // Source row: [source codec] [source resolution]. Codecs are gated to what the GPU can
+  // hw-decode ∩ what ships at the chosen resolution. When a CUSTOM file is picked, the row
+  // shows the file's DETECTED codec + resolution as static text (the file dictates them).
+  const row = document.getElementById("inputrow");
+  const g = (s.gpus||[]).find(x=>x.idx===s.selected_idx);
+  if(!g){ row.style.display="none"; return; }
+  row.style.display="flex";
+  const f = s.selected_custom ? (s.custom_files||[]).find(x=>x.name===s.selected_custom) : null;
+  const sel = document.getElementById("inputc"), fx = document.getElementById("inputfixed");
+  const sresSel = document.getElementById("sres"), sresFx = document.getElementById("sresfixed");
+  if(f){
+    sel.style.display = "none"; fx.style.display = "";
+    fx.textContent = (CODEC_LABEL[f.codec] || (f.codec||"?").toUpperCase()) + " · your file";
+    sresSel.style.display = "none"; sresFx.style.display = "";
+    sresFx.textContent = resFromWH(f.res) || "—";
+    return;
+  }
+  sel.style.display = ""; fx.style.display = "none";
+  // restore the mode-driven resolution control (convert = dropdown, streaming = locked 4K)
+  const conv = (s.selected_mode||"streaming") === "convert";
+  sresSel.style.display = conv ? "" : "none";
+  sresFx.style.display = conv ? "none" : "";
+  sresFx.textContent = "4K";
+  const codecs = srcCodecs(s, g); if(!codecs.length) codecs.push(s.selected_input||"hevc");
+  fillSel("inputc", codecs, s.selected_input, c=>CODEC_LABEL[c]||c);
+  fillSel("sres", s.source_res_options||["4k"], s.selected_source_res||"4k", r=>RES_LABEL[r]||r);
+}
+function renderCodec(s){
+  // Output row: [output codec] [output resolution (<= source, no upscaling)].
+  const row = document.getElementById("codecrow");
+  const g = (s.gpus||[]).find(x=>x.idx===s.selected_idx);
+  if(!g){ row.style.display="none"; return; }
+  row.style.display="flex";
+  fillSel("codec", g.codecs||["h264"], s.selected_codec, c=>CODEC_LABEL[c]||c);
+  const sr = s.selected_source_res||"4k";
+  fillSel("tres", (s.target_res_by_source||{})[sr]||["1080p"], s.selected_target_res||"1080p", r=>RES_LABEL[r]||r);
+}
+function selectSubs(on){ post("/subs?b="+(on?1:0)); }
+function renderSubs(s){
+  // burn-in toggle: streaming-mode realism modifier. Hidden in convert mode; disabled for the
+  // HDR source (combined tone-map + burn chain is unsupported in v1 — the backend enforces it).
+  const row = document.getElementById("subsrow");
+  const g = (s.gpus||[]).find(x=>x.idx===s.selected_idx);
+  const streaming = (s.selected_mode||"streaming") === "streaming";
+  if(!g || !streaming){ row.style.display="none"; return; }
+  row.style.display = "flex";
+  const hdr = s.selected_input === "hdr";
+  const chk = document.getElementById("subschk");
+  chk.checked = !!s.selected_subs && !hdr;
+  chk.disabled = hdr;
+  document.getElementById("subsnote").textContent =
+    hdr ? "— not available with the HDR source" : "(heavier — like PGS subs on Plex)";
+}
+function renderNote(s){
+  // conversion mode is a local speed test (never a leaderboard score); streaming at 4K→1080p is
+  // always comparable, so no scary "local-only" note is needed there.
+  const conv = (s.selected_mode||"streaming")==="convert";
+  const sr=s.selected_source_res||"4k", tr=s.selected_target_res||"1080p";
+  const tenbit=(["hevc","av1"].indexOf(s.selected_input)>=0 && tr===sr && ["hevc","av1"].indexOf(s.selected_codec)>=0);
+  document.getElementById("advnote").innerHTML = conv
+    ? '<span class="local">Local speed test — not a streaming leaderboard score.</span>'+(tenbit?" Output kept 10-bit.":"")
+    : (s.selected_custom ? '<span class="local">Your own file — local-only result, not comparable.</span>' : "");
+}
+function selectSourceRes(r){ post("/sres?r="+r); }
+function selectTargetRes(r){ post("/tres?r="+r); }
+function selectMode(m){ post("/mode?m="+m); }
+function renderMode(s){
+  const m = s.selected_mode || "streaming", conv = (m === "convert");
+  document.querySelectorAll(".modebtn").forEach(b=>b.classList.toggle("active", b.dataset.mode===m));
+  // resolution: convert mode = real dropdowns; streaming = LOCKED 4K→1080p shown as static text
+  // (keep the row shape identical across modes; the fixed values must not look clickable)
+  document.getElementById("srespart").style.display = "inline-flex";
+  document.getElementById("trespart").style.display = "inline-flex";
+  document.getElementById("sres").style.display = conv ? "" : "none";
+  document.getElementById("tres").style.display = conv ? "" : "none";
+  document.getElementById("sresfixed").style.display = conv ? "none" : "";
+  document.getElementById("tresfixed").style.display = conv ? "none" : "";
+  const hdrIn = s.selected_input === "hdr";
+  const extras = (hdrIn ? " · HDR→SDR tone-mapped" : "") + (s.selected_subs ? " · subs burned in" : "");
+  document.getElementById("rdesc").innerHTML = conv
+    ? "Re-encode speed for any codec/resolution — per-file time + best worker count"
+    : (s.selected_custom
+        ? "Your file&nbsp;→&nbsp;1080p · <b>"+(s.bitrate||"8M")+"</b> · strict ≥ 1.0× realtime · how many at once"
+        : "4K&nbsp;→&nbsp;1080p · <b>"+(s.bitrate||"8M")+"</b> · strict ≥ 1.0× realtime · how many at once"+extras);
+}
+
+function escHtml(x){ return (x||"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+
+function renderCustom(s){
+  const row = document.getElementById("customrow");
+  const list = document.getElementById("customlist");
+  if(s.custom_library){
+    row.classList.add("show");
+    list.innerHTML = '<div class="clib">⚠ The <b>/input</b> folder looks like a media library '
+      + '(too many files). Point it at a folder containing just your test clip(s).</div>';
+    return;
+  }
+  const files = s.custom_files || [];
+  row.classList.add("show");
+  if(!files.length){
+    // always-visible with a friendly empty state — the feature was invisible before you'd
+    // already set the mount up, which made it undiscoverable
+    list.innerHTML = '<div class="cempty">No files yet — drop a video into this container\'s '
+      + '<b>/input</b> folder (the "Your test clips folder" path in the container settings) '
+      + 'and it will appear here.</div>';
+    return;
+  }
+  const g = (s.gpus||[]).find(x=>x.idx===s.selected_idx);
+  const decodes = (g && g.decodes) ? g.decodes : [];
+  let html = '<div class="cfile'+(!s.selected_custom?' sel':'')+'" onclick="clearCustom()">'
+    + '<span class="cname">Built-in test clip</span><span class="cmeta">shipped</span></div>';
+  files.forEach((f,i)=>{
+    const cod = f.codec || '?';
+    const dec = decodes.indexOf(cod) >= 0;
+    const meta = (f.res?f.res+' · ':'') + (CODEC_LABEL[cod]||cod.toUpperCase()) + (dec?'':' · can’t decode');
+    html += '<div class="cfile'+(s.selected_custom===f.name?' sel':'')+(dec?'':' disabled')+'"'
+      + (dec?(' onclick="selectCustomIdx('+i+')"'):'') + '>'
+      + '<span class="cname">'+escHtml(f.name)+'</span><span class="cmeta">'+meta+'</span></div>';
+  });
+  list.innerHTML = html;
+}
+function selectCustomIdx(i){ const f=(LAST.custom_files||[])[i]; if(f) post("/custom?f="+encodeURIComponent(f.name)); }
+function clearCustom(){ post("/custom?f="); }
+
+function fmtDur(mins){
+  if(!isFinite(mins) || mins<=0) return "—";
+  if(mins < 1) return Math.round(mins*60)+" sec";
+  if(mins < 60) return (mins<10 ? mins.toFixed(1) : Math.round(mins))+" min";
+  const h=Math.floor(mins/60), m=Math.round(mins%60);
+  return h+"h"+(m ? (" "+m+"m") : "");
+}
+// signpost: leave the streaming verdict and reopen the picker in conversion mode (reset must
+// land us idle before /mode is accepted, so chain the two posts)
+async function goConvert(){
+  try{ await fetch("/reset",{method:"POST"}); await fetch("/mode?m=convert",{method:"POST"}); }
+  catch(e){}
+  tick();
+}
+
+// self-contained inline SVG: combined throughput (Y) vs worker count (X).
+// levels=[{n,combined}]; testingN pulses at the level being measured (live); fastestN stars a point.
+function curveSvg(levels, testingN, fastestN){
+  const pts = (levels||[]).map(L=>({n:L.n, c:L.combined})).sort((a,b)=>a.n-b.n);
+  const ns = pts.map(p=>p.n);
+  if(testingN && ns.indexOf(testingN)<0) ns.push(testingN);
+  if(!ns.length) return "";
+  const xMax = Math.max.apply(null, ns);
+  const yMax = Math.max(1, Math.max.apply(null, pts.map(p=>p.c).concat([0]))) * 1.18;
+  const W=320, H=170, padL=16, padR=16, padT=18, padB=26;
+  const X = n => padL + (xMax<=1 ? (W-padL-padR)/2 : (n-1)/(xMax-1)*(W-padL-padR));
+  const Y = c => (H-padB) - (c/yMax)*(H-padT-padB);
+  const axis = '<line class="cvaxis" x1="'+padL+'" y1="'+(H-padB)+'" x2="'+(W-padR)+'" y2="'+(H-padB)+'"/>';
+  const line = pts.length>1
+    ? '<polyline class="cvline" points="'+pts.map(p=>X(p.n)+','+Y(p.c)).join(' ')+'"/>' : '';
+  let dots="";
+  pts.forEach(p=>{
+    const best = (p.n===fastestN);
+    dots += '<circle class="cvdot'+(best?' best':'')+'" cx="'+X(p.n)+'" cy="'+Y(p.c)+'" r="'+(best?5:3.5)+'"/>'
+          + '<text class="cvval'+(best?' best':'')+'" x="'+X(p.n)+'" y="'+(Y(p.c)-9)+'">'+fmt(p.c)+'×'+(best?' ★':'')+'</text>';
+  });
+  const meas = testingN ? '<circle class="cvmeas" cx="'+X(testingN)+'" cy="'+(H-padB)+'" r="5"/>' : "";
+  let xl="";
+  for(let n=1;n<=xMax;n++) xl += '<text class="cvx" x="'+X(n)+'" y="'+(H-8)+'">'+n+'</text>';
+  return '<svg class="cvsvg" viewBox="0 0 '+W+' '+H+'" preserveAspectRatio="xMidYMid meet">'
+    + axis+line+dots+meas+xl+'</svg>';
+}
+
+function renderConvBody(s, r){
+  const sp = r.single_stream||0, comb = r.peak_combined||0, rec = r.rec_workers||1;
+  const levels = (r.per_level||[]).slice().sort((a,b)=>a.n-b.n);
+  const speedup = (sp>0 && comb>0) ? (comb/sp) : 1;   // whole-library speed vs one-at-a-time
+  // LEFT panel — per-file speed & time
+  const times = [["📺 1 hr show",60],["🎬 1.5 hr movie",90],["🎬 2.5 hr movie",150]]
+    .map(([lbl,mins]) => '<span>'+lbl+' <b>~'+fmtDur(mins/(sp||1))+'</b></span>').join("");
+  const left =
+    '<div class="cvcol cvspeed"><div class="cvtitle">Per-file speed</div>'
+    + '<div class="cvbignum">'+fmt(sp)+'×<span>realtime per file</span></div>'
+    + '<div class="cvtimes">'+times+'</div>'
+    + '<div class="cvlib">Whole library, flat out: <b>~'+Math.round(comb)+' hours</b> of video per hour of GPU time.</div></div>';
+  // RIGHT panel — best worker count: recommendation + frozen curve + table + one honest line
+  let best = 0;
+  const rows = levels.map((L,i) => {
+    const c = L.combined, gain = (i===0 || best<=0) ? null : Math.round((c/best-1)*100);
+    best = Math.max(best, c);
+    const isBest = (L.n === rec);
+    return '<div class="brow'+(isBest?' best':'')+'"><span class="bn">'+L.n+' worker'+(L.n>1?'s':'')+(isBest?' ★ fastest':'')+'</span>'
+      + '<span>'+fmt(c)+'× total'+(gain!==null?' <span class="bgain">('+(gain>=0?'+':'')+gain+'%)</span>':'')+'</span></div>';
+  }).join("");
+  const eff = (rec<=1)
+    ? '<div class="beff">One at a time is the fastest for this profile — this GPU\'s video engine is already saturated by a single stream, so extra parallel workers only slow the total down.</div>'
+    : '<div class="beff">~'+rec+' at once finishes your library about <b>'+fmt(speedup)+'× faster</b> than one at a time, at roughly the <b>same power draw</b> (so ~'+fmt(speedup)+'× more power-efficient). Beyond '+rec+' the throughput plateaus.</div>';
+  const right =
+    '<div class="cvcol cvworkers"><div class="cvtitle">Best worker count</div>'
+    + '<div class="cvrec">'+rec+' worker'+(rec>1?'s':'')+'<span>set this in Tdarr / Unmanic</span></div>'
+    + '<div class="cvchart">'+curveSvg(levels, null, rec)+'</div>'
+    + '<div class="batch">'+rows+'</div>'+eff+'</div>';
+  document.getElementById("convbody").innerHTML = '<div class="cvcols">'+left+right+'</div>';
+}
+
+function vsMetric(k, val){
+  return '<div class="vsm"><span class="vk">'+k+'</span><span class="vv">'+val+'</span></div>';
+}
+function renderVsCpu(r){
+  const el = document.getElementById("vscpu");
+  // the CPU device's OWN verdict: tell the user it's now the stored baseline
+  if(r.is_cpu){
+    el.className = "show";
+    el.innerHTML = (r.baseline_saved === false)
+      ? '<div class="vsnote">CPU result measured, but it <b>couldn\'t be saved</b> — mount the '
+        + '<b>/config</b> app-data path so GPU runs can compare against it.</div>'
+      : '<div class="vsnote">This is your <b>CPU baseline</b> ('
+        + (r.cpu_encoder||"software") + (r.cpu_preset?" · "+r.cpu_preset:"")
+        + ') — GPU runs of this same profile now compare against it.</div>';
+    return;
+  }
+  const v = r.vs_cpu;
+  if(!v){   // GPU run with no matching baseline → quiet nudge
+    if(r.cpu_baseline_missing){
+      el.className = "show";
+      el.innerHTML = '<div class="vsnote">Run a <b>CPU test</b> for this profile to see how much '
+        + 'faster and more power-efficient this GPU is.</div>';
+    } else el.className = "";
+    return;
+  }
+  const encL = (v.cpu_encoder||"software") + (v.cpu_preset?" · "+v.cpu_preset:"");
+  const rows = [];
+  if(v.speed_kind === "streams")
+    rows.push(vsMetric("Speed", v.cpu_could_sustain
+      ? (v.gpu_speed+" vs "+v.cpu_speed+" streams at realtime")
+      : "CPU can't sustain even one at realtime"));
+  else if(v.speed!=null)
+    rows.push(vsMetric("Speed", v.speed+"× faster per file"));
+  if(v.watts_gpu!=null && v.watts_cpu!=null)
+    rows.push(vsMetric("Power draw", Math.round(v.watts_gpu)+" W vs "+Math.round(v.watts_cpu)+" W"));
+  if(v.energy_gpu!=null && v.energy_cpu!=null)
+    rows.push(vsMetric("Energy / hr of video", v.energy_gpu+" Wh vs "+v.energy_cpu+" Wh"));
+  const big = (v.efficiency!=null) ? ("~"+v.efficiency+"× more power-efficient")
+            : (v.speed!=null) ? ("~"+v.speed+"× faster than CPU") : "vs CPU";
+  const caveat = v.dgpu_caveat
+    ? '<div class="vscaveat">GPU figure is board power; CPU is CPU-package power — a directional comparison, not a lab measurement.</div>'
+    : '';
+  el.className = "show";
+  el.innerHTML = '<div class="vscard"><div class="vshead">vs CPU ('+encL+')</div>'
+    + '<div class="vsbig">'+big+'</div><div class="vsgrid">'+rows.join("")+'</div>'+caveat+'</div>';
+}
+
+// per-codec decode/encode badges for a picker card (marks are ordered decode / encode)
+function capBadges(g){
+  const mk = c => {
+    const di = (g.decodes||[]).indexOf(c)>=0, en = (g.codecs||[]).indexOf(c)>=0;
+    const lbl = c==="h264" ? "H264" : c==="hevc" ? "HEVC" : "AV1";
+    return '<span class="gcap" title="'+lbl+': '+(di?"can decode":"can’t decode")+" in · "
+      +(en?"can encode":"can’t encode")+' out">'+lbl+' <span class="'+(di?'y':'n')+'">'
+      +(di?'✓':'✗')+'</span><span class="'+(en?'y':'n')+'">'+(en?'✓':'✗')+'</span></span>';
+  };
+  // HDR badge is decode-side only: can this device hardware tone-map HDR10 → SDR?
+  const tm = (g.decodes||[]).indexOf("hdr")>=0;
+  const hdrB = '<span class="gcap" title="HDR10 → SDR tone-mapping '
+    +(tm?"supported":"not supported by this device’s driver")+'">HDR <span class="'
+    +(tm?'y':'n')+'">'+(tm?'✓':'✗')+'</span></span>';
+  return '<div class="gcaps">'+["h264","hevc","av1"].map(mk).join("")+hdrB+'</div>';
+}
+
+// verdict history strip: past runs of the SAME device+mode+profile + headline delta vs last
+function renderHistory(s){
+  const el = document.getElementById("vhistory");
+  const r = s.result||{}, hist = s.history||[], d = s.history_delta;
+  if(s.batch || !hist.length){ el.className=""; el.innerHTML=""; return; }
+  let html = "";
+  if(d && d.pct!=null){
+    const up = d.pct>=0, unit = d.metric==="streams" ? " streams" : "× per file";
+    const ramNow = r.ram || s.ram_speed, ramPrev = hist[0].ram_speed;
+    const ramNote = (ramPrev && ramNow && ramPrev!==ramNow)
+      ? ' <span class="hnote">RAM '+escHtml(ramPrev)+' → '+escHtml(ramNow)+'</span>' : "";
+    html += '<div class="hdelta '+(up?'up':'down')+'">'+(up?'▲ +':'▼ ')+d.pct
+      +'% vs your last run ('+d.prev+unit+' → '+d.cur+unit+')'+ramNote+'</div>';
+  }
+  html += '<div class="hhead">Previous runs — this device &amp; profile</div>';
+  hist.slice(0,3).forEach(h=>{
+    const when = h.ts ? new Date(h.ts*1000).toLocaleDateString(undefined,{month:"short",day:"numeric"}) : "";
+    const head = h.mode==="streaming"
+      ? ('<b>'+(h.max_sustained!=null?h.max_sustained:"—")+' streams</b>'+(h.capped?" (capped)":""))
+      : ('<b>'+fmt(h.single_stream)+'×</b> per file');
+    html += '<div class="hrow">'+when+' · '+head
+      +(h.ram_speed?(' · RAM '+escHtml(h.ram_speed)):'')
+      +(h.watts_per_stream!=null?(' · '+h.watts_per_stream+' W/stream'):'')+'</div>';
+  });
+  el.className = "show"; el.innerHTML = html;
+}
+
+// live stability sparkline: worst-stream speed over the current level (streaming only)
+const SPARK = {n:-1, pts:[]};
+function sparkSvg(pts, mark){
+  if(pts.length<2) return "";
+  const W=300, H=84, p=5;
+  const mx = Math.max(mark*1.4, Math.max.apply(null, pts))*1.05;
+  const X = i => p + i/(pts.length-1)*(W-2*p);
+  const Y = v => H-p - (Math.max(0, Math.min(v, mx))/mx)*(H-2*p);
+  const line = pts.map((v,i)=>X(i)+","+Y(v)).join(" ");
+  const fill = line+" "+X(pts.length-1)+","+(H-p)+" "+X(0)+","+(H-p);   // close to baseline
+  return '<svg class="sparksvg" viewBox="0 0 '+W+' '+H+'" preserveAspectRatio="none">'
+    + '<polygon class="skfill" points="'+fill+'"/>'
+    + '<line class="skmark" x1="'+p+'" y1="'+Y(mark)+'" x2="'+(W-p)+'" y2="'+Y(mark)+'"/>'
+    + '<polyline class="skline" points="'+line+'"/></svg>';
+}
+
+// test-all comparison table (batch verdict)
+function renderBatch(s){
+  const rows = s.batch_results||[];
+  const streaming = (s.selected_mode||"streaming")==="streaming";
+  let bestVal=-1, bestIdx=-1;
+  rows.forEach((b,i)=>{
+    if(b.error) return;
+    const v = streaming ? (b.capped ? (b.projected||b.max_sustained||0) : (b.max_sustained||0))
+                        : (b.single_stream||0);
+    if(v>bestVal){ bestVal=v; bestIdx=i; }
+  });
+  const head = '<div class="bth"><span>Device</span><span>'+(streaming?'Streams':'Per file')
+    +'</span><span>≈W/stream</span><span>Power</span></div>';
+  const body = rows.map((b,i)=>{
+    if(b.error) return '<div class="btr"><span class="bdev">'+escHtml(b.gpu)
+      +'</span><span class="bcell">failed</span></div>';
+    const headv = streaming
+      ? (b.capped ? ('≈'+b.projected+' <small>(cap '+b.max_sustained+')</small>') : (b.max_sustained!=null?b.max_sustained:'—'))
+      : (fmt(b.single_stream)+'×'+(b.rec_workers?' <small>· '+b.rec_workers+'w</small>':''));
+    const est = b.power_estimated?' <small>(est.)</small>':'';
+    return '<div class="btr'+(i===bestIdx?' best':'')+'"><span class="bdev">'+(i===bestIdx?'★ ':'')
+      +escHtml(b.gpu)+(b.is_cpu?' <small>(CPU)</small>':'')+'</span>'
+      +'<span class="bcell">'+headv+'</span>'
+      +'<span class="bcell">'+(b.watts_per_stream!=null?(b.watts_per_stream+est):'—')+'</span>'
+      +'<span class="bcell">'+(b.peak_power_w!=null?(Math.round(b.peak_power_w)+' W'+est):'—')+'</span></div>';
+  }).join("");
+  // devices that sat the batch out, with the reason — visible, not silently missing
+  const skipped = (s.batch_skipped||[]).map(k =>
+    '<div class="btr skip"><span class="bdev">'+escHtml(k.gpu)+'</span>'
+    +'<span class="bcell">skipped — '+escHtml(k.reason||"")+'</span></div>').join("");
+  document.getElementById("batchbody").innerHTML = '<div class="btable">'+head+body+skipped+'</div>';
+}
+function startAll(){ post("/startall"); }
+
+function resultText(){
+  const r = LAST.result; if(!r) return "";
+  const head = r.capped ? (r.max_sustained+" streams (driver-capped; ≈"+r.projected+" uncapped)")
+                        : (r.max_sustained+" streams");
+  const eff = (r.watts_per_stream!=null)
+    ? (r.mode==="convert"
+        ? ("≈"+r.watts_per_stream+" Wh per hour of video"+(r.power_estimated?" (est)":""))
+        : ("≈"+r.watts_per_stream+" W/stream"+(r.power_estimated?" (est)":"")+
+           (r.streams_per_watt!=null?(" · "+fmt(r.streams_per_watt)+" streams/W"):"")))
+    : "";
+  return ["GPU Transcode Benchmark — "+r.gpu,
+    "Result: "+head+"  ["+r.profile+", "+(CODEC_LABEL[r.codec]||r.codec)+" "+r.bitrate+"]",
+    "Single-stream "+fmt(r.single_stream)+"× · peak combined "+fmt(r.peak_combined)+"×"+(eff?(" · "+eff):""),
+    (r.power_insight||""),
+    "Driver "+(drvStr(r)||"?")+(r.ram?(" · RAM "+r.ram):"")+(r.cpu?(" · "+r.cpu):""),
+    (r.os_version?("Unraid "+r.os_version+" · "):"")+"kernel "+(r.kernel||"?"),
+  ].filter(Boolean).join("\n");
+}
+async function copyResult(){
+  const txt = resultText(); if(!txt) return;
+  try{ await navigator.clipboard.writeText(txt + "\n\n" + JSON.stringify(LAST.result));
+       flash("copybtn","Copied!"); }catch(e){ flash("copybtn","Copy failed"); }
+}
+function flash(id,t){ const b=document.getElementById(id); const o=b.textContent; b.textContent=t; setTimeout(()=>b.textContent=o,1500); }
+
+function wrapText(x, text, left, top, maxW, lh){
+  const words=(text||"").split(" "); let line="", y=top;
+  for(const w of words){
+    if(x.measureText(line+w+" ").width > maxW && line){ x.fillText(line,left,y); line=w+" "; y+=lh; }
+    else line+=w+" ";
+  }
+  if(line) x.fillText(line,left,y);
+  return y;
+}
+function downloadCard(){
+  const r = LAST.result; if(!r) return;
+  const est=r.power_estimated;
+  const W=1000,H=660,c=document.createElement("canvas"); c.width=W;c.height=H;
+  const x=c.getContext("2d"); const acc=VENDOR_COLORS[r.vendor]||"#4aa3ff";
+  x.fillStyle="#0a0e14"; x.fillRect(0,0,W,H);
+  x.fillStyle=acc; x.fillRect(0,0,W,10);
+  x.fillStyle="#7b8aa0"; x.font="600 22px Segoe UI,sans-serif"; x.fillText("GPU TRANSCODE BENCHMARK",40,62);
+  x.fillStyle="#e8eef7"; x.font="800 38px Segoe UI,sans-serif"; x.fillText(r.gpu,40,110);
+  let y=420;
+  if(r.mode==="convert"){
+    // conversion card: per-file speed headline + the actionable worker table
+    x.fillStyle=acc; x.font="900 130px Segoe UI,sans-serif"; x.fillText(fmt(r.single_stream)+"×",40,260);
+    x.fillStyle="#7b8aa0"; x.font="600 23px Segoe UI,sans-serif";
+    x.fillText("PER FILE · "+r.profile+" · "+r.bitrate, 40, 300);
+    x.fillStyle="#e8eef7"; x.font="700 25px Segoe UI,sans-serif";
+    x.fillText("Tdarr / Unmanic: set ~"+(r.rec_workers||1)+" concurrent worker"+((r.rec_workers||1)>1?"s":""), 40, 344);
+    x.font="20px Segoe UI,sans-serif"; y=378;
+    (r.per_level||[]).slice(0,6).forEach(L=>{
+      const star = (L.n===r.rec_workers);
+      x.fillStyle = star ? acc : "#cdd9e8";
+      x.fillText((star?"★ ":"   ")+L.n+" worker"+(L.n>1?"s":"")+"  —  "+fmt(L.combined)+"× total", 40, y);
+      y+=28;
+    });
+    y+=18;
+  } else {
+    x.fillStyle=acc; x.font="900 180px Segoe UI,sans-serif"; x.fillText(""+r.max_sustained,40,300);
+    x.fillStyle="#7b8aa0"; x.font="600 23px Segoe UI,sans-serif";
+    x.fillText("MAX SUSTAINED "+r.profile+" · "+(CODEC_LABEL[r.codec]||r.codec)+" "+r.bitrate, 40, 346);
+    if(r.capped){ x.fillStyle="#f1c40f";
+      const why = r.limit_reason==="memory" ? "VRAM ceiling" : r.limit_reason==="unknown" ? "resource limit" : "driver session cap";
+      x.fillText(why+" at "+r.max_sustained+(r.projected?(" — engine throughput ≈"+r.projected+"× realtime"):""), 40, 378); }
+  }
+  if(r.watts_per_stream!=null){
+    x.fillStyle=acc; x.font="800 26px Segoe UI,sans-serif";
+    const hedged = (est && !(r.is_cpu&&r.power_rapl)) ? " (est.)" : "";
+    x.fillText(r.mode==="convert"
+      ? ("≈"+r.watts_per_stream+" Wh per hour of video converted"+hedged+"   ·   1.5 hr movie ≈ "+movieWh(r.watts_per_stream)+" Wh")
+      : ("≈"+r.watts_per_stream+" W / stream"+hedged+
+         (r.streams_per_watt!=null?("   ·   "+r.streams_per_watt+" streams/W"):"")), 40, y); y+=34;
+  }
+  x.fillStyle="#9fb0c8"; x.font="19px Segoe UI,sans-serif";
+  let pwr = est ? (r.peak_power_w!=null?((r.is_cpu?"CPU transcoding adds":"iGPU adds")+" ~"+Math.round(r.peak_power_w)+" W under load"+((r.is_cpu&&r.power_rapl)?"":" (est.)")):"")
+    : [r.idle_power_w!=null?("idle "+Math.round(r.idle_power_w)+" W"):null,
+       r.one_stream_power_w!=null?((r.mode==="convert"?"1 worker ":"1 stream ")+Math.round(r.one_stream_power_w)+" W"):null,
+       r.load_power_w!=null?("full load "+Math.round(r.load_power_w)+" W"):null].filter(Boolean).join("  →  ");
+  if(pwr){ x.fillText("Power: "+pwr, 40, y); y+=34; }
+  // adaptive insight (wrapped)
+  if(r.power_insight){ x.fillStyle="#cdd9e8"; x.font="19px Segoe UI,sans-serif";
+    y = wrapText(x, r.power_insight, 40, y+4, W-80, 26) + 30; }
+  // footer specs
+  x.fillStyle="#7b8aa0"; x.font="18px Segoe UI,sans-serif";
+  x.fillText("driver "+(drvStr(r)||"?")+(r.ram?("   RAM "+r.ram):"")+
+    (r.os_version?("   Unraid "+r.os_version):""), 40, Math.min(y, H-24));
+  const a=document.createElement("a");
+  a.href=c.toDataURL("image/png"); a.download=(r.gpu.replace(/[^a-z0-9]+/gi,"_"))+"_benchmark.png"; a.click();
+}
+
+async function post(path){ try{ await fetch(path,{method:"POST"}); }catch(e){} tick(); }
+function select(i){ post("/select?i="+i); }
+function selectCodec(c){ post("/codec?c="+c); }
+function start(){ document.getElementById("startbtn").disabled=true; post("/start"); }
+function reset(){ post("/reset"); }
+function selectInput(c){ post("/input?c="+c); }
+function continueRun(){ post("/continue"); }
+function cancelRun(){ post("/cancel"); }
+function askCancel(){ document.getElementById("confirm").classList.add("show"); }
+function dismissCancel(){ document.getElementById("confirm").classList.remove("show"); }
+function abortRun(){ dismissCancel(); post("/abort"); }
+function submitResult(){
+  const sb = document.getElementById("submitbtn");
+  if(sb.disabled) return;
+  sb.disabled = true; sb.textContent = "Submitting…";   // re-enabled by tick() unless submitted
+  post("/submit");
+}
+
+// tap/click tooltips: title= attributes are invisible on touch — clicking any titled element
+// shows the same text in a popover; clicking elsewhere dismisses it.
+document.addEventListener("click", e=>{
+  const box = document.getElementById("tipbox");
+  const t = e.target.closest ? e.target.closest("[title]") : null;
+  if(t && t.getAttribute("title")){
+    box.textContent = t.getAttribute("title");
+    box.style.display = "block";
+    const rc = t.getBoundingClientRect();
+    box.style.left = Math.max(8, Math.min(window.innerWidth-340, rc.left))+"px";
+    box.style.top  = (rc.bottom + 8 + window.scrollY)+"px";
+  } else box.style.display = "none";
+});
+
+setInterval(tick, 1000);
+tick();
+</script>
+<div id="tipbox"></div>
+</body>
+</html>
