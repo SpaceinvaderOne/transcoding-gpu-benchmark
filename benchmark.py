@@ -90,7 +90,7 @@ UNRAID_VER_FILE = _env("UNRAID_VER_FILE", "/unraid-version")  # optional RO moun
 # will move to gpu.spaceinvader.one once the domain's DNS is on Cloudflare. Setting the env var
 # to empty/whitespace disables submission entirely (the Submit button never shows).
 SUBMIT_URL      = _env("SUBMIT_URL", "https://gpu.spaceinvader.one/api/submit").strip()
-TOOL_VERSION    = "1.0"
+TOOL_VERSION    = "1.1"
 
 # SMBIOS Memory Device "Memory Type" enum (subset)
 MEM_TYPE = {0x13: "DDR", 0x14: "DDR2", 0x18: "DDR3", 0x1A: "DDR4", 0x1E: "LPDDR",
@@ -916,18 +916,35 @@ def clip_master(source_res, input_codec):
     return os.path.join(CLIPS_DIR, f"source_{source_res}_{input_codec}.mkv")
 
 
-def verify_file_hash(path, sha256_hex):
-    """SHA-256 the whole file and compare (constant memory; used at download time only —
-    cached clips are trusted by exact size afterwards, spinning appdata arrays shouldn't
-    re-read 1.85 GB every boot)."""
+def sha256_file(path):
+    """Full SHA-256 hex digest of a file (constant memory), or None on error."""
     try:
         h = hashlib.sha256()
         with open(path, "rb") as f:
             for chunk in iter(lambda: f.read(1024 * 1024), b""):
                 h.update(chunk)
-        return h.hexdigest() == sha256_hex
+        return h.hexdigest()
     except Exception:
-        return False
+        return None
+
+
+def verify_file_hash(path, sha256_hex):
+    """SHA-256 the whole file and compare (used at download time; cached clips are trusted by
+    exact size afterwards — spinning appdata arrays shouldn't re-read 1.85 GB every boot)."""
+    return sha256_file(path) == sha256_hex
+
+
+def copy_with_sha256(src, dst):
+    """Copy src → dst while hashing the bytes in the SAME pass — the clip is read once anyway
+    when it's hot-loaded into the ramdisk, so the SHA-256 is effectively free (no extra disk
+    read). Returns the hex digest of what was actually written to `dst`. This makes the staged
+    hash a fact about the bytes ffmpeg will decode, not about some earlier cache check."""
+    h = hashlib.sha256()
+    with open(src, "rb") as fi, open(dst, "wb") as fo:
+        for chunk in iter(lambda: fi.read(1024 * 1024), b""):
+            fo.write(chunk)
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def cached_ok(path, size):
@@ -1633,32 +1650,53 @@ def sample_custom(path):
 
 
 _STAGED_VERIFIED = True   # was the last staged canonical clip the pinned bitstream?
+_STAGED_SHA = None        # SHA-256 of the clip CURRENTLY in the ramdisk (canonical clips only)
 
 
 def stage_clip(source_res, input_codec, custom_path=None):
     """Get the source into the ramdisk and return its path. Custom file → a middle-60 s sample;
     otherwise the canonical clip (shipped in transition images / cached in appdata / downloaded
     on demand with live progress / generated offline as a last resort — see ensure_clip).
-    Clear-before-stage keeps exactly ONE clip in RAM so a 512 MiB ramdisk always fits."""
-    global _STAGED, _STAGED_VERIFIED
+    Clear-before-stage keeps exactly ONE clip in RAM so a 512 MiB ramdisk always fits.
+
+    The staged clip is SHA-256'd against the pinned manifest (during the copy — the bytes are
+    read anyway, so it's ~free) and, crucially, RE-hashed on the reuse path: a previously staged
+    clip is trusted only if its bytes STILL match. That closes the swap-after-stage hole (run
+    once → swap the staged file in the RAM-disk mount → run again on the easy clip). It binds the
+    submission to a correctly staged pinned bitstream — it does NOT prove what ffmpeg consumed on
+    hardware the user controls; that tier is handled statistically + by moderation (by design)."""
+    global _STAGED, _STAGED_VERIFIED, _STAGED_SHA
     if custom_path:
         _STAGED = None
+        _STAGED_SHA = None
         return sample_custom(custom_path)
     key = (source_res, input_codec)
+    name = os.path.basename(clip_master(source_res, input_codec))
+    expected_sha = CLIP_MANIFEST.get(name, (None, None))[0]
     os.makedirs(RAMDISK, exist_ok=True)
+    # REUSE PATH — a clip is already in RAM. Re-hash it every run (cheap vs a transcode) so a
+    # file swapped into the ramdisk between runs cannot ride a stale "verified" flag. Bytes still
+    # match ⇒ trust; else fall through and re-stage from the master (self-heals).
     if _STAGED == key and os.path.exists(SOURCE):
-        return SOURCE                       # already in RAM
+        if expected_sha is None:
+            return SOURCE                   # non-manifest clip (dev build): nothing to verify
+        cur = sha256_file(SOURCE)
+        if cur == expected_sha:
+            _STAGED_SHA, _STAGED_VERIFIED = cur, True
+            return SOURCE
     clear_ramdisk()
     master, verified = ensure_clip(source_res, input_codec, abort_event=_ABORT)
-    _STAGED_VERIFIED = verified
     if master.startswith(RAMDISK):
         # one-shot download straight into the ramdisk (no /config): RENAME, never copy —
-        # two 455 MB copies would overflow the 512 MiB tmpfs
+        # two 455 MB copies would overflow the 512 MiB tmpfs (download already hash-verified)
         os.replace(master, SOURCE)
-        _STAGED = key
-        return SOURCE
-    publish(phase="preparing", message=f"Loading {source_res} {input_codec.upper()} test clip into RAM…")
-    shutil.copyfile(master, SOURCE)
+        _STAGED_SHA = sha256_file(SOURCE) if expected_sha else None
+    else:
+        publish(phase="preparing", message=f"Loading {source_res} {input_codec.upper()} test clip into RAM…")
+        _STAGED_SHA = copy_with_sha256(master, SOURCE)   # hash the staged bytes for free
+    # the staged clip is verified iff its ACTUAL bytes match the manifest (subsumes the download/
+    # generate checks); fall back to ensure_clip's verdict only when there's no manifest hash
+    _STAGED_VERIFIED = (_STAGED_SHA == expected_sha) if expected_sha else verified
     _STAGED = key
     return SOURCE
 
@@ -1821,7 +1859,7 @@ def _build_result(gpu, codec, confirmed_max, single, peak_combined, per_level,
                   capped, projected, pwr, input_codec="hevc", custom_source=False,
                   source_res="4k", target_res="1080p", ten_bit=False,
                   mode="streaming", rec_workers=None, preset="veryfast", subs=False,
-                  clip_verified=True):
+                  clip_verified=True, clip_sha256=None):
     """Assemble the structured result payload + efficiency.
     `pwr` = {idle, idle_pkg, one, one_pkg, peak, peak_pkg} (board + package watts).
     Returns (result, spw, power_estimated)."""
@@ -1879,7 +1917,7 @@ def _build_result(gpu, codec, confirmed_max, single, peak_combined, per_level,
         "vs_cpu": None, "cpu_baseline_missing": False,
         "profile": profile, "codec": codec, "input_codec": input_codec,
         "source_res": source_res, "target_res": target_res, "ten_bit": ten_bit,
-        "subs_burn": subs, "clip_verified": clip_verified,
+        "subs_burn": subs, "clip_verified": clip_verified, "clip_sha256": clip_sha256,
         "comparable": comparable,
         "bitrate": OUTPUT_BITRATE_BY_RES.get(target_res, OUTPUT_BITRATE),
         "threshold": PASS_THRESHOLD,
@@ -2132,7 +2170,8 @@ def benchmark(gpu, codec="h264", input_codec="hevc", custom_path=None,
             capped, projected, pwr, input_codec, custom_source=bool(custom_path),
             source_res=source_res, target_res=target_res, ten_bit=ten_bit,
             mode=mode, rec_workers=rec_workers, preset=preset, subs=subs,
-            clip_verified=(_STAGED_VERIFIED if not custom_path else True))
+            clip_verified=(_STAGED_VERIFIED if not custom_path else True),
+            clip_sha256=(_STAGED_SHA if not custom_path else None))
         result.update(vram_extra)
 
         # CPU baseline persistence & the GPU "vs CPU" efficiency comparison (skip for custom clips —

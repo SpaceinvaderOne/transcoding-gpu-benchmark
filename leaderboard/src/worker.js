@@ -38,6 +38,20 @@ const VENDORS = ["intel", "amd", "nvidia"];
 const IN_CODECS = ["h264", "hevc", "av1", "hdr"];   // "hdr" = the HDR10 tone-map profile
 const OUT_CODECS = ["h264", "hevc", "av1"];
 
+// SHA-256 of the pinned clips-v1 source clips, per input codec (the 4K→1080p comparable set).
+// The client hashes the clip it actually STAGES into the RAM disk and reports clip_sha256; the
+// server checks it matches the pinned bitstream for the run's input codec. This raises the
+// tampering floor: swapping the appdata/staged file for an easier one now yields a wrong hash
+// and a rejected submission. It does NOT prove what ffmpeg decoded on user-owned hardware (the
+// client is public and could be modified, or the JSON forged with curl) — that tier is handled
+// statistically (median of clean runs) + moderation. See the board-hardening spec.
+const CLIP_SHA = {
+  h264: "9c44eef58045ceaf1e768a9f6736eb3119e67aae7f3fadde25de19ae58d920e1",
+  hevc: "13ff9e46afac887744c508fac0bf343281ebf1168e8ff9017ab7532be9f5a27a",
+  av1:  "8e2da2352791d4f3c066c29ebfe92b0bd657ec898233be635d43e099aee728f6",
+  hdr:  "41a36e640fa40609bcbab0ce0f42a1fba58c1ef3808606f816da6ec57cbd4bce",
+};
+
 // The profile string is DERIVED from the validated structured fields and must match what the
 // client sent — a submission cannot invent arbitrary profile boards (mirrors the container's
 // profile_label(); comparable runs are always 4K→1080p non-custom, so no custom/res variants)
@@ -71,8 +85,12 @@ function validate(env0) {
   // canonical workload. NOTE: this also rejects pre-clips-round client builds (field absent) —
   // deliberate, same policy as the threshold field before it.
   if (r.clip_verified !== true) return "clip not verified against the pinned release";
-  if (!VENDORS.includes(r.vendor)) return "unknown vendor";
   if (!IN_CODECS.includes(r.input_codec)) return "unknown input codec";
+  // the staged clip's hash must match the pinned bitstream for this input codec (server holds
+  // the expected values, so clips-vN generations are gated centrally). Rejects pre-1.1 clients
+  // (field absent) — deliberate, same policy as threshold/clip_verified before it.
+  if (r.clip_sha256 !== CLIP_SHA[r.input_codec]) return "clip hash does not match the pinned bitstream";
+  if (!VENDORS.includes(r.vendor)) return "unknown vendor";
   if (!OUT_CODECS.includes(r.codec)) return "unknown output codec";
   if (r.ten_bit === true) return "10-bit output is not a comparable profile";  // 4K→1080p is 8-bit
   if (typeof r.gpu !== "string" || !r.gpu.length || r.gpu.length > 120) return "bad gpu";

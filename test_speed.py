@@ -930,6 +930,63 @@ class TestClipResolve(unittest.TestCase):
         self.assertEqual(status, "missing")
 
 
+class TestClipStageHash(unittest.TestCase):
+    """The staged clip is hashed WHILE being copied into the ramdisk (same bytes, one pass) and
+    RE-hashed when a previously staged copy is reused — closing the swap-after-stage hole. This
+    binds a submission to a correctly staged pinned clip; it cannot (nothing client-side can)
+    prove what ffmpeg consumed on user-owned hardware."""
+    def setUp(self):
+        import tempfile, hashlib
+        self.tmp = tempfile.mkdtemp()
+        self.ram = tempfile.mkdtemp()
+        self._old = (benchmark.CLIPS_DIR, benchmark.CLIPS_CACHE_DIR, benchmark.RAMDISK,
+                     benchmark.SOURCE, dict(benchmark.CLIP_MANIFEST), benchmark._STAGED)
+        benchmark.CLIPS_DIR, benchmark.CLIPS_CACHE_DIR, benchmark.RAMDISK = self.tmp, self.tmp, self.ram
+        benchmark.SOURCE = os.path.join(self.ram, "source.mkv")
+        self.data = b"pinned-bitstream-" * 1000
+        self.sha = hashlib.sha256(self.data).hexdigest()
+        name = "source_4k_hevc.mkv"
+        with open(os.path.join(self.tmp, name), "wb") as f:
+            f.write(self.data)
+        benchmark.CLIP_MANIFEST = {name: (self.sha, len(self.data))}
+        benchmark._STAGED = None
+
+    def tearDown(self):
+        (benchmark.CLIPS_DIR, benchmark.CLIPS_CACHE_DIR, benchmark.RAMDISK,
+         benchmark.SOURCE, benchmark.CLIP_MANIFEST, benchmark._STAGED) = self._old
+
+    def test_copy_with_sha256(self):
+        dst = os.path.join(self.ram, "out.bin")
+        sha = benchmark.copy_with_sha256(os.path.join(self.tmp, "source_4k_hevc.mkv"), dst)
+        self.assertEqual(sha, self.sha)
+        with open(dst, "rb") as f:
+            self.assertEqual(f.read(), self.data)
+
+    def test_fresh_stage_records_hash_and_verifies(self):
+        p = benchmark.stage_clip("4k", "hevc")
+        self.assertEqual(p, benchmark.SOURCE)
+        self.assertTrue(benchmark._STAGED_VERIFIED)
+        self.assertEqual(benchmark._STAGED_SHA, self.sha)
+
+    def test_reuse_rehashes_and_heals_a_swapped_file(self):
+        benchmark.stage_clip("4k", "hevc")
+        # attacker swaps the STAGED copy for an easier file of the same size
+        with open(benchmark.SOURCE, "wb") as f:
+            f.write(b"x" * len(self.data))
+        p = benchmark.stage_clip("4k", "hevc")     # second run: must NOT trust the stale hash
+        self.assertEqual(p, benchmark.SOURCE)
+        self.assertEqual(benchmark._STAGED_SHA, self.sha)   # re-staged from the master
+        self.assertTrue(benchmark._STAGED_VERIFIED)
+        with open(benchmark.SOURCE, "rb") as f:
+            self.assertEqual(f.read(), self.data)  # the tampered copy was replaced
+
+    def test_reuse_with_intact_file_stays_verified(self):
+        benchmark.stage_clip("4k", "hevc")
+        p = benchmark.stage_clip("4k", "hevc")
+        self.assertTrue(benchmark._STAGED_VERIFIED)
+        self.assertEqual(benchmark._STAGED_SHA, self.sha)
+
+
 class TestRunComparable(unittest.TestCase):
     """clip_verified joins the comparable gate: a locally generated (hash-mismatched) clip can
     never produce a leaderboard-eligible run."""
