@@ -13,7 +13,7 @@
   <Category>Other:</Category>
   <WebUI>http://[IP]:[PORT:8088]</WebUI>
   <TemplateURL/>
-  <Icon/>
+  <Icon>https://raw.githubusercontent.com/SpaceinvaderOne/transcoding-gpu-benchmark/main/icon.png</Icon>
   <ExtraParams>--cap-add PERFMON</ExtraParams>
   <PostArgs/>
   <CPUset/>

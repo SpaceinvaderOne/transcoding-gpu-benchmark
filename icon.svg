@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#12365c"/>
+      <stop offset="1" stop-color="#071322"/>
+    </linearGradient>
+    <linearGradient id="sheen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.10"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+  <!-- rounded tile -->
+  <rect x="16" y="16" width="480" height="480" rx="96" fill="url(#bg)"/>
+  <rect x="16" y="16" width="480" height="480" rx="96" fill="url(#sheen)"/>
+  <rect x="16" y="16" width="480" height="480" rx="96" fill="none" stroke="#3b6ea8" stroke-width="6" opacity="0.55"/>
+  <!-- chip pins -->
+  <g stroke="#7fb2e6" stroke-width="14" stroke-linecap="round" opacity="0.9">
+    <line x1="150" y1="96" x2="150" y2="130"/><line x1="220" y1="96" x2="220" y2="130"/>
+    <line x1="290" y1="96" x2="290" y2="130"/><line x1="360" y1="96" x2="360" y2="130"/>
+    <line x1="150" y1="382" x2="150" y2="416"/><line x1="220" y1="382" x2="220" y2="416"/>
+    <line x1="290" y1="382" x2="290" y2="416"/><line x1="360" y1="382" x2="360" y2="416"/>
+    <line x1="96" y1="170" x2="130" y2="170"/><line x1="96" y1="256" x2="130" y2="256"/>
+    <line x1="96" y1="342" x2="130" y2="342"/>
+    <line x1="382" y1="170" x2="416" y2="170"/><line x1="382" y1="256" x2="416" y2="256"/>
+    <line x1="382" y1="342" x2="416" y2="342"/>
+  </g>
+  <!-- chip body -->
+  <rect x="128" y="128" width="256" height="256" rx="34" fill="#0d1b2c" stroke="#5e97d0" stroke-width="10"/>
+  <!-- vendor benchmark bars -->
+  <g>
+    <rect x="168" y="272" width="42" height="72" rx="10" fill="#2a7de1"/>
+    <rect x="235" y="232" width="42" height="112" rx="10" fill="#e0393e"/>
+    <rect x="302" y="188" width="42" height="156" rx="10" fill="#76b900"/>
+  </g>
+  <!-- play arrow -->
+  <path d="M 208 168 L 208 214 L 250 191 Z" fill="#ffffff" opacity="0.95"/>
+  <!-- speed ticks -->
+  <g stroke="#9fc6ef" stroke-width="8" stroke-linecap="round" opacity="0.85">
+    <line x1="270" y1="176" x2="306" y2="176"/>
+    <line x1="270" y1="196" x2="330" y2="196"/>
+  </g>
+</svg>
