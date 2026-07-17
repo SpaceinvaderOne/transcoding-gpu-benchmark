@@ -31,3 +31,12 @@ CREATE INDEX IF NOT EXISTS idx_sub_profile ON submissions(profile, hidden);
 -- sliding-window rate limiting (ip hashes only; raw IPs are never stored)
 CREATE TABLE IF NOT EXISTS ratelimit (ip_hash TEXT NOT NULL, ts INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_rl ON ratelimit(ip_hash, ts);
+
+-- moderation audit trail (one admin, so no identity column yet): every hide/restore is recorded
+CREATE TABLE IF NOT EXISTS moderation_actions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  submission_id INTEGER NOT NULL,
+  action TEXT NOT NULL,          -- hide | restore
+  reason TEXT,
+  created_at INTEGER NOT NULL
+);

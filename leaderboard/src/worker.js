@@ -1,19 +1,26 @@
 // GPU Transcode Benchmark leaderboard — Cloudflare Worker + D1.
 // Implements docs/superpowers/specs/2026-07-07-leaderboard-submission-contract.md exactly:
-//   POST /api/submit  — validated envelope ingest (upsert best per install+gpu+profile)
-//   GET  /api/top     — median-per-GPU board rows (?profile=..., canonical by default)
-//   POST /api/hide    — admin moderation (?id=&token=ADMIN_TOKEN)
-//   GET  /            — the public leaderboard page
+//   POST /api/submit         — validated envelope ingest (upsert best per install+gpu+profile)
+//   GET  /api/top            — median-per-GPU board rows (?profile=..., canonical by default)
+//   GET  /api/detail|profiles — public read-only board data
+//   POST /api/admin/hide|restore?id= — moderation (Authorization: Bearer <ADMIN_TOKEN>, audited)
+//   GET  /                   — the public leaderboard page
 const SCHEMA = 1;
 const ACCEPTED_MAJOR = "1";                       // result.tool_version major versions accepted
 const CANONICAL = "4K HEVC -> 1080p H264";
 const RATE_PER_HOUR = 30;                         // submissions per ip_hash per hour
 const MAX_BODY = 32 * 1024;
 
-const json = (obj, status = 200) =>
+// CORS is PER-ROUTE: public read-only GETs may be embedded anywhere (jsonPub); the submit and
+// admin POSTs get NO CORS headers and NO preflight approval — an arbitrary webpage cannot use
+// visitors' browsers to post submissions. (Scripted/curl submissions are unaffected; this
+// closes the cheap browser-distributed-abuse route only. The strict application/json content
+// type stays REQUIRED — text/plain or form posts can skip preflight entirely.)
+const json = (obj, status = 200, extra = {}) =>
   new Response(JSON.stringify(obj), { status, headers: { "Content-Type": "application/json",
-    "Access-Control-Allow-Origin": "*", "Cache-Control": "no-store" } });
-const bad = (error, status = 400) => json({ ok: false, error }, status);
+    "Cache-Control": "no-store", ...extra } });
+const jsonPub = (obj, status = 200) => json(obj, status, { "Access-Control-Allow-Origin": "*" });
+const bad = (error, status = 400, extra = {}) => json({ ok: false, error }, status, extra);
 
 async function sha256hex(s) {
   const d = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
@@ -22,6 +29,20 @@ async function sha256hex(s) {
 
 // ---- validation (the contract's server checklist) --------------------------------------------
 function num(v) { return typeof v === "number" && isFinite(v); }
+
+const VENDORS = ["intel", "amd", "nvidia"];
+const IN_CODECS = ["h264", "hevc", "av1", "hdr"];   // "hdr" = the HDR10 tone-map profile
+const OUT_CODECS = ["h264", "hevc", "av1"];
+
+// The profile string is DERIVED from the validated structured fields and must match what the
+// client sent — a submission cannot invent arbitrary profile boards (mirrors the container's
+// profile_label(); comparable runs are always 4K→1080p non-custom, so no custom/res variants)
+function expectedProfile(r) {
+  return "4K " + String(r.input_codec).toUpperCase() + " -> 1080p "
+    + String(r.codec).toUpperCase() + (r.subs_burn ? " + subs" : "");
+}
+
+function capStr(v, max) { return typeof v === "string" && v.length <= max; }
 
 function validate(env0) {
   if (!env0 || typeof env0 !== "object") return "bad envelope";
@@ -42,8 +63,21 @@ function validate(env0) {
   // the timing exploit that would otherwise own any headline statistic
   if (!num(r.hold_seconds) || r.hold_seconds < 25) return "non-standard hold duration";
   if (!num(r.settle_seconds) || r.settle_seconds < 5) return "non-standard settle duration";
+  // the pinned-bitstream guarantee: a locally generated (hash-mismatched) clip is not the
+  // canonical workload. NOTE: this also rejects pre-clips-round client builds (field absent) —
+  // deliberate, same policy as the threshold field before it.
+  if (r.clip_verified !== true) return "clip not verified against the pinned release";
+  if (!VENDORS.includes(r.vendor)) return "unknown vendor";
+  if (!IN_CODECS.includes(r.input_codec)) return "unknown input codec";
+  if (!OUT_CODECS.includes(r.codec)) return "unknown output codec";
+  if (r.ten_bit === true) return "10-bit output is not a comparable profile";  // 4K→1080p is 8-bit
   if (typeof r.gpu !== "string" || !r.gpu.length || r.gpu.length > 120) return "bad gpu";
-  if (typeof r.profile !== "string" || r.profile.length > 80) return "bad profile";
+  // profile must equal the string DERIVED from the validated fields — no invented boards
+  if (r.profile !== expectedProfile(r)) return "profile does not match run parameters";
+  // length caps on every stored display string (defence in depth alongside output escaping)
+  for (const [k, max] of [["driver", 60], ["os_version", 60], ["kernel", 60],
+                          ["ram", 40], ["cpu", 120]])
+    if (r[k] != null && !capStr(r[k], max)) return "bad " + k;
   if (!Number.isInteger(r.max_sustained) || r.max_sustained < 1 || r.max_sustained > 128)
     return "max_sustained out of range";
   if (!num(r.single_stream) || r.single_stream <= 0 || r.single_stream > 100)
@@ -64,8 +98,12 @@ function validate(env0) {
   // one knife-edge level from the ambiguity — negligible vs rejecting real marginal runs.)
   // Historical: a looser 0.95 tolerance likewise rejected honest 0.95–0.999 marginal fails.
   let highestDefinite = 0, highestPossible = 0, maxCombined = 0;
-  for (const L of pl) {
+  for (let i = 0; i < pl.length; i++) {
+    const L = pl[i];
     if (!L || !Number.isInteger(L.n) || !num(L.worst) || !num(L.combined)) return "bad per_level row";
+    // the ramp is strictly sequential from 1 — reject shuffled/duplicated/gapped curves
+    if (L.n !== i + 1) return "per_level must be sequential from 1";
+    if (L.worst < 0 || L.worst > 100 || L.combined < 0 || L.combined > 256) return "per_level out of range";
     if (L.worst >= 1.0005) highestDefinite = Math.max(highestDefinite, L.n);
     if (L.worst >= 0.9995) {
       highestPossible = Math.max(highestPossible, L.n);
@@ -81,10 +119,23 @@ function validate(env0) {
 
 // ---- routes -----------------------------------------------------------------------------------
 async function handleSubmit(request, env) {
+  // emergency kill switch: set SUBMISSIONS_ENABLED=false (Worker var) to pause ingest during
+  // an abuse wave without touching moderation or the read routes
+  if (env.SUBMISSIONS_ENABLED === "false")
+    return bad("submissions are temporarily paused", 503);
+  // fail CLOSED when the salt secret is missing — never fall back to a publicly known value
+  if (!env.RATE_SALT) {
+    console.error("RATE_SALT is not configured");
+    return bad("service unavailable", 503);
+  }
   if ((request.headers.get("Content-Type") || "").indexOf("application/json") < 0)
     return bad("expected application/json", 415);
+  // reject a declared-oversized body BEFORE reading it (the post-read check stays: the
+  // Content-Length header may be absent or wrong)
+  const declared = parseInt(request.headers.get("Content-Length") || "0", 10);
+  if (declared > MAX_BODY) return bad("too large", 413);
   const body = await request.text();
-  if (body.length > MAX_BODY) return bad("too large", 413);
+  if (new TextEncoder().encode(body).length > MAX_BODY) return bad("too large", 413);
   let envelope;
   try { envelope = JSON.parse(body); } catch { return bad("invalid json"); }
   const err = validate(envelope);
@@ -92,13 +143,17 @@ async function handleSubmit(request, env) {
 
   // rate limit per hashed ip (raw IP never stored) — salt lives in a Worker secret
   const ip = request.headers.get("CF-Connecting-IP") || "0.0.0.0";
-  const ipHash = (await sha256hex((env.RATE_SALT || "dev-salt") + ip)).slice(0, 32);
+  const ipHash = (await sha256hex(env.RATE_SALT + ip)).slice(0, 32);
   const hourAgo = Math.floor(Date.now() / 1000) - 3600;
   const { results: rl } = await env.DB.prepare(
     "SELECT COUNT(*) AS c FROM ratelimit WHERE ip_hash = ? AND ts > ?").bind(ipHash, hourAgo).all();
-  if (rl[0].c >= RATE_PER_HOUR) return bad("rate limited", 429);
+  if (rl[0].c >= RATE_PER_HOUR)
+    return bad("rate limited", 429, { "Retry-After": "3600" });
   const now = Math.floor(Date.now() / 1000);
   await env.DB.prepare("INSERT INTO ratelimit (ip_hash, ts) VALUES (?, ?)").bind(ipHash, now).run();
+  // probabilistic cleanup: expired ip-hash rows are useless — don't retain them indefinitely
+  if (Math.random() < 0.05)
+    await env.DB.prepare("DELETE FROM ratelimit WHERE ts < ?").bind(hourAgo).run();
 
   const r = envelope.result;
   // upsert: keep the BEST run per (install, gpu, profile); resubmits update, never stack
@@ -119,7 +174,8 @@ async function handleSubmit(request, env) {
       r.max_sustained, r.capped ? 1 : 0, r.projected ?? null, r.single_stream,
       r.peak_combined, r.watts_per_stream ?? null, r.power_estimated ? 1 : 0,
       r.driver || null, r.os_version || null, r.kernel || null, r.ram || null, r.cpu || null,
-      envelope.submitted_at ?? now, now, ipHash, body).run();
+      // server receipt time is authoritative (the client's submitted_at stays in raw only)
+      now, now, ipHash, body).run();
   return json({ ok: true });
 }
 
@@ -198,7 +254,7 @@ async function handleTop(url, env) {
     };
   // ranking = clean median (or the marked loaded fallback); IDENTICAL in both toggle states
   }).sort((a, b) => b.median_streams - a.median_streams);
-  return json({ profile, rows: out });
+  return jsonPub({ profile, rows: out });
 }
 
 async function handleDetail(url, env) {
@@ -232,7 +288,7 @@ async function handleDetail(url, env) {
   const { results: recent } = await env.DB.prepare(
     `SELECT ${fields} FROM submissions WHERE ${where}
      ORDER BY updated_at DESC LIMIT 10`).bind(profile, gpu).all();
-  return json({ gpu, profile, dist, top, recent });
+  return jsonPub({ gpu, profile, dist, top, recent });
 }
 
 async function handleProfiles(env) {
@@ -243,14 +299,27 @@ async function handleProfiles(env) {
   // canonical always listed (and first) even before it has submissions
   if (!results.some(r => r.profile === CANONICAL)) results.unshift({ profile: CANONICAL, count: 0 });
   else results.sort((a, b) => (a.profile === CANONICAL ? -1 : b.profile === CANONICAL ? 1 : b.count - a.count));
-  return json({ profiles: results, canonical: CANONICAL });
+  return jsonPub({ profiles: results, canonical: CANONICAL });
 }
 
-async function handleHide(url, env) {
-  const token = url.searchParams.get("token"), id = url.searchParams.get("id");
-  if (!env.ADMIN_TOKEN || token !== env.ADMIN_TOKEN) return bad("forbidden", 403);
-  await env.DB.prepare("UPDATE submissions SET hidden = 1 WHERE id = ?").bind(id).run();
-  return json({ ok: true });
+// Admin moderation: token in the Authorization header (NEVER a query string — URLs leak into
+// histories/logs), integer-validated id, 404 on missing, every action audited, restorable.
+//   POST /api/admin/hide?id=<n>[&reason=...]     Authorization: Bearer <ADMIN_TOKEN>
+//   POST /api/admin/restore?id=<n>[&reason=...]  Authorization: Bearer <ADMIN_TOKEN>
+async function handleAdmin(request, url, env, action) {
+  const auth = request.headers.get("Authorization") || "";
+  if (!env.ADMIN_TOKEN || auth !== "Bearer " + env.ADMIN_TOKEN) return bad("forbidden", 403);
+  const id = parseInt(url.searchParams.get("id") || "", 10);
+  if (!Number.isInteger(id) || id < 1) return bad("bad id");
+  const row = await env.DB.prepare("SELECT id, hidden FROM submissions WHERE id = ?").bind(id).first();
+  if (!row) return bad("not found", 404);
+  const hidden = action === "hide" ? 1 : 0;
+  await env.DB.prepare("UPDATE submissions SET hidden = ? WHERE id = ?").bind(hidden, id).run();
+  const reason = (url.searchParams.get("reason") || "").slice(0, 200) || null;
+  await env.DB.prepare(
+    "INSERT INTO moderation_actions (submission_id, action, reason, created_at) VALUES (?,?,?,?)")
+    .bind(id, action, reason, Math.floor(Date.now() / 1000)).run();
+  return json({ ok: true, id, action });
 }
 
 // ---- the public page ---------------------------------------------------------------------------
@@ -514,17 +583,24 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     const p = url.pathname;
-    if (request.method === "OPTIONS")
-      return new Response(null, { headers: { "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "GET,POST", "Access-Control-Allow-Headers": "Content-Type" } });
+    // NO blanket preflight approval: the POST routes are not for browsers (the container posts
+    // server-side, where CORS doesn't apply). GET routes never need preflight. An OPTIONS
+    // request gets no CORS headers → cross-origin browser POSTs are refused by the browser.
+    if (request.method === "OPTIONS") return new Response(null, { status: 405 });
     if (p === "/api/submit" && request.method === "POST") return handleSubmit(request, env);
     if (p === "/api/top" && request.method === "GET") return handleTop(url, env);
     if (p === "/api/detail" && request.method === "GET") return handleDetail(url, env);
     if (p === "/api/profiles" && request.method === "GET") return handleProfiles(env);
-    if (p === "/api/hide" && request.method === "POST") return handleHide(url, env);
+    if (p === "/api/admin/hide" && request.method === "POST") return handleAdmin(request, url, env, "hide");
+    if (p === "/api/admin/restore" && request.method === "POST") return handleAdmin(request, url, env, "restore");
     if (p === "/" || p === "/index.html")
       return new Response(PAGE, { headers: { "Content-Type": "text/html; charset=utf-8",
-        "Cache-Control": "no-store" } });
+        "Cache-Control": "no-store",
+        // the page is fully self-contained (inline script/style, same-origin fetches only)
+        "Content-Security-Policy": "default-src 'none'; script-src 'unsafe-inline'; " +
+          "style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; " +
+          "base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+        "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer" } });
     return bad("not found", 404);
   }
 };
