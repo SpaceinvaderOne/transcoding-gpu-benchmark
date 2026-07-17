@@ -265,6 +265,31 @@
   #allbtn{display:block;margin:10px auto 0;background:none;border:1px solid #2c3e55;color:var(--muted);border-radius:10px;padding:9px 18px;font-size:14.5px;cursor:pointer}
   #allbtn:hover{border-color:var(--accent);color:var(--ink)}
   #batchprog{font-size:13px;color:var(--amber);margin-top:6px}
+  #batchpanel{display:none;margin:10px auto 0;width:min(560px,92%);background:#0e1521;border:1px solid #25405d;border-radius:12px;padding:14px 18px;text-align:left}
+  #batchpanel.show{display:block}
+  #batchpanel .bpk label{display:block;font-size:14px;color:var(--ink);margin:4px 0;cursor:pointer}
+  #batchpanel .bpk input{accent-color:#4da3ff;margin-right:6px}
+  #batchpanel .bpd{margin:10px 0 4px;display:flex;flex-wrap:wrap;gap:10px}
+  #batchpanel .bpd label{font-size:13.5px;color:#cdd9e8;background:#12233a;border:1px solid #2c3e55;border-radius:9px;padding:5px 10px;cursor:pointer}
+  #batchpanel .bpd input{accent-color:#4da3ff;margin-right:5px}
+  #batchpanel .bpn{font-size:12.5px;color:var(--muted);margin:8px 0}
+  #batchpanel .bps{background:var(--accent);color:#04121f;font-weight:700;border:none;border-radius:9px;padding:8px 18px;font-size:14px;cursor:pointer}
+  #btabs{display:none;margin:16px auto 0;max-width:720px;text-align:left}
+  #btabs.show{display:block}
+  #btabs .tabstrip{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px}
+  #btabs .btab{background:#0e1928;border:1px solid #2c3e55;border-radius:9px 9px 0 0;padding:6px 12px;font-size:12.5px;color:var(--muted);cursor:pointer}
+  #btabs .btab.on{background:#16304d;color:var(--ink);border-color:var(--accent)}
+  #btabdetail{background:#0e1521;border:1px solid #25405d;border-radius:12px;padding:16px 20px}
+  #btabdetail .bd-big{font-size:44px;font-weight:900;color:var(--accent);line-height:1}
+  #btabdetail .bd-cap{font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted)}
+  #btabdetail .bd-prof{font-size:14.5px;color:#e8eef7;margin:6px 0 10px}
+  #btabdetail .bd-note{font-size:13px;color:var(--amber);margin-bottom:8px}
+  #btabdetail .bd-lv{display:flex;justify-content:space-between;font-size:13px;color:#cdd9e8;padding:3px 0;border-top:1px solid #16233a}
+  #btabdetail .bd-lvh{display:flex;justify-content:space-between;font-size:10.5px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);padding-bottom:4px;margin-top:10px}
+  #btabdetail .bd-spec{font-size:12px;color:var(--muted);margin-top:10px}
+  #suballbtn{display:none;margin:14px auto 0;background:var(--accent);color:#04121f;font-weight:700;border:none;border-radius:10px;padding:10px 20px;font-size:14.5px;cursor:pointer}
+  #suballbtn.show{display:inline-block}
+  .bsub{font-size:12px;margin-left:8px}.bsub.ok{color:var(--green)}.bsub.err{color:var(--red)}.bsub.local{color:var(--muted)}
   #batchbody{display:none;margin:14px auto 0;max-width:720px}
   #batchbody.show{display:block}
   #batchbody .btable{background:#0e1521;border:1px solid #25405d;border-radius:12px;padding:14px 20px;text-align:left}
@@ -380,7 +405,16 @@
       <div id="customlist"></div>
     </div>
     <button class="bigbtn" id="startbtn" onclick="start()">▶ START</button>
-    <button id="allbtn" onclick="startAll()" title="Runs the same test on every capable device (GPUs + CPU) one after another, then shows a side-by-side comparison. Make sure the GPUs are idle — the busy check is skipped in a batch.">⚡ Test all devices</button>
+    <button id="allbtn" onclick="toggleBatchPanel()" title="Run several tests one after another (strictly sequential — parallel GPUs would skew each other). Pick the devices and whether to sweep every source codec or repeat the current test.">⚡ Batch tests</button>
+    <div id="batchpanel">
+      <div class="bpk">
+        <label><input type="radio" name="bkind" value="sweep" checked onchange="renderBatchPanel(LAST)"> All sources → <b id="bpout">H.264</b> <span class="cmuted">— one run per source each device supports</span></label>
+        <label><input type="radio" name="bkind" value="current" onchange="renderBatchPanel(LAST)"> Current test on the selected devices</label>
+      </div>
+      <div class="bpd" id="bpdevs"></div>
+      <div class="bpn" id="bpnote"></div>
+      <button class="bps" onclick="startBatch()">▶ Start batch</button>
+    </div>
     <div class="rsrc" id="rsrc"></div>
   </div>
 
@@ -412,6 +446,8 @@
     <div class="desc" id="vdesc"></div>
     <div class="foot" id="vfoot"></div>
     <div id="batchbody"></div>
+    <div id="btabs"><div class="tabstrip"></div><div id="btabdetail"></div></div>
+    <button id="suballbtn" onclick="submitBatch()"></button>
     <div id="convbody"></div>
     <div id="vscpu"></div>
     <div id="vhistory"></div>
@@ -489,7 +525,7 @@ async function tick(){
     predict.textContent += (predict.textContent?" · ":"")+s.vram_note;
   document.getElementById("batchprog").textContent =
     (s.batch && (s.ui==="running"||s.ui==="preparing") && (s.batch_queue||[]).length)
-      ? ("Device "+Math.min((s.batch_done||0)+1,(s.batch_queue||[]).length)+" of "+s.batch_queue.length+" — "+(s.batch_queue[Math.min(s.batch_done||0, s.batch_queue.length-1)]||""))
+      ? ("Run "+Math.min((s.batch_done||0)+1,(s.batch_queue||[]).length)+" of "+s.batch_queue.length+" — "+(s.batch_queue[Math.min(s.batch_done||0, s.batch_queue.length-1)]||""))
       : "";
 
   // stability sparkline: worst-stream speed across the current level (streaming runs only)
@@ -593,10 +629,11 @@ function renderScreens(s, vendor){
     document.getElementById("rtitle").textContent = hasAvail ? "Choose a GPU to test" : "No testable GPU found";
     document.getElementById("startbtn").style.display = hasAvail ? "" : "none";
     document.getElementById("startbtn").disabled = (s.selected_idx == null);
-    // test-all only makes sense with 2+ devices and shipped clips (a custom file can't be
-    // decoded everywhere, so the comparison wouldn't be apples-to-apples)
+    // batches need shipped clips (a custom file can't be decoded everywhere); a source
+    // sweep is useful even with a single device, so no 2+ device requirement any more
     document.getElementById("allbtn").style.display =
-      (hasAvail && !s.selected_custom && gpus.filter(g=>g.available).length>1) ? "" : "none";
+      (hasAvail && !s.selected_custom) ? "" : "none";
+    renderBatchPanel(s);
     document.getElementById("rsrc").innerHTML = !hasAvail
       ? "Pass <b>/dev/dri</b> (Intel/AMD) and/or add <b>--runtime=nvidia</b> (NVIDIA)."
       : (s.selected_custom
@@ -629,16 +666,26 @@ function renderScreens(s, vendor){
     v.classList.add("show");
     const batch = !!(s.batch && (s.batch_results||[]).length);
     document.getElementById("batchbody").classList.toggle("show", batch);
+    if(!batch){
+      document.getElementById("btabs").classList.remove("show");
+      document.getElementById("suballbtn").classList.remove("show");
+    }
     document.getElementById("copybtn").style.display = batch ? "none" : "";
     document.getElementById("pngbtn").style.display = batch ? "none" : "";
     if(batch){
-      // TEST-ALL verdict: the comparison table IS the result — hide the single-run furniture
+      // BATCH verdict: summary table first, then full per-run results in tabs
       v.classList.remove("fail");
       document.getElementById("vcap").style.display = "";
-      document.getElementById("vcap").textContent = "Device comparison";
+      document.getElementById("vcap").textContent = "Batch results";
       document.getElementById("vnum").style.display = "none";
-      document.getElementById("vdesc").innerHTML = prof+" — "+s.batch_results.length+" device"+(s.batch_results.length>1?"s":"");
-      document.getElementById("vfoot").textContent = "The same test on every capable device, one after another. ★ = fastest.";
+      const nOK = s.batch_results.filter(b=>!b.error).length;
+      document.getElementById("vdesc").innerHTML = nOK+" run"+(nOK!==1?"s":"")+" — summary below, click a tab for the full result";
+      document.getElementById("vfoot").textContent = "Runs are strictly sequential with a cool-down between — parallel GPUs would skew each other.";
+      renderBatchTabs(s);
+      const comps = s.batch_results.filter(b=>b.full && b.comparable && !b.submitted).length;
+      const sab = document.getElementById("suballbtn");
+      sab.classList.toggle("show", !!(s.submit_url_set && comps));
+      sab.textContent = "⇪ Submit "+comps+" result"+(comps!==1?"s":"")+" to the leaderboard";
       document.getElementById("veff").innerHTML = "";
       document.getElementById("vinsight").style.display = "none";
       document.getElementById("vspecs").innerHTML = (r.os_version?("Unraid <b>"+r.os_version+"</b>"):"")+(r.kernel?(" · kernel "+r.kernel):"");
@@ -736,6 +783,8 @@ function _doneTail(ui){
     document.getElementById("vscpu").className = "";
     document.getElementById("vhistory").className = "";
     document.getElementById("batchbody").classList.remove("show");
+    document.getElementById("btabs").classList.remove("show");
+    document.getElementById("suballbtn").classList.remove("show");
     document.getElementById("reconv").classList.remove("show");
     document.getElementById("suberr").className = "";
   }
@@ -1182,24 +1231,32 @@ function sparkSvg(pts, mark){
 function renderBatch(s){
   const rows = s.batch_results||[];
   const streaming = (s.selected_mode||"streaming")==="streaming";
+  // ★ fastest only means something when every row ran the SAME profile (the classic
+  // cross-device compare); in a source sweep the rows are different workloads — no star
+  const profs = [...new Set(rows.filter(b=>!b.error).map(b=>b.profile))];
   let bestVal=-1, bestIdx=-1;
-  rows.forEach((b,i)=>{
+  if(profs.length===1) rows.forEach((b,i)=>{
     if(b.error) return;
     const v = streaming ? (b.capped ? (b.projected||b.max_sustained||0) : (b.max_sustained||0))
                         : (b.single_stream||0);
     if(v>bestVal){ bestVal=v; bestIdx=i; }
   });
-  const head = '<div class="bth"><span>Device</span><span>'+(streaming?'Streams':'Per file')
+  const head = '<div class="bth"><span>Run</span><span>'+(streaming?'Streams':'Per file')
     +'</span><span>≈W/stream</span><span>Power</span></div>';
   const body = rows.map((b,i)=>{
     if(b.error) return '<div class="btr"><span class="bdev">'+escHtml(b.gpu)
+      +(b.profile?' <small>'+escHtml(b.profile)+'</small>':'')
       +'</span><span class="bcell">failed</span></div>';
     const headv = streaming
       ? (b.capped ? ('≈'+b.projected+' <small>(cap '+b.max_sustained+')</small>') : (b.max_sustained!=null?b.max_sustained:'—'))
       : (fmt(b.single_stream)+'×'+(b.rec_workers?' <small>· '+b.rec_workers+'w</small>':''));
     const est = b.power_estimated?' <small>(est.)</small>':'';
+    const sub = b.submitted ? ' <span class="bsub ok">✓ submitted</span>'
+      : b.submit_error ? ' <span class="bsub err" title="'+escHtml(b.submit_error)+'">✗</span>'
+      : (b.full && !b.comparable) ? ' <span class="bsub local">local-only</span>' : '';
     return '<div class="btr'+(i===bestIdx?' best':'')+'"><span class="bdev">'+(i===bestIdx?'★ ':'')
-      +escHtml(b.gpu)+(b.is_cpu?' <small>(CPU)</small>':'')+'</span>'
+      +escHtml(b.gpu)+(b.is_cpu?' <small>(CPU)</small>':'')
+      +(profs.length>1&&b.profile?'<div><small>'+escHtml(b.profile)+'</small></div>':'')+sub+'</span>'
       +'<span class="bcell">'+headv+'</span>'
       +'<span class="bcell">'+(b.watts_per_stream!=null?(b.watts_per_stream+est):'—')+'</span>'
       +'<span class="bcell">'+(b.peak_power_w!=null?(Math.round(b.peak_power_w)+' W'+est):'—')+'</span></div>';
@@ -1210,7 +1267,85 @@ function renderBatch(s){
     +'<span class="bcell">skipped — '+escHtml(k.reason||"")+'</span></div>').join("");
   document.getElementById("batchbody").innerHTML = '<div class="btable">'+head+body+skipped+'</div>';
 }
-function startAll(){ post("/startall"); }
+function toggleBatchPanel(){
+  document.getElementById("batchpanel").classList.toggle("show");
+  renderBatchPanel(LAST);
+}
+function batchKind(){
+  const r = document.querySelector('input[name="bkind"]:checked');
+  return r ? r.value : "sweep";
+}
+function renderBatchPanel(s){
+  const panel = document.getElementById("batchpanel");
+  if(!panel.classList.contains("show")) return;
+  const gpus = (s.gpus||[]).filter(g=>g.available);
+  const prevChecks = {};
+  panel.querySelectorAll(".bpd input").forEach(c=>{prevChecks[c.dataset.i]=c.checked;});
+  document.getElementById("bpout").textContent = CODEC_LABEL[s.selected_codec]||"H.264";
+  document.getElementById("bpdevs").innerHTML = gpus.map(g=>
+    '<label><input type="checkbox" data-i="'+g.idx+'" '
+    +((prevChecks[g.idx]===undefined?true:prevChecks[g.idx])?'checked':'')
+    +' onchange="renderBatchPanel(LAST)">'+escHtml(g.name)+(g.vendor==="cpu"?' (CPU)':'')+'</label>').join("");
+  // run-count estimate mirrors the server's job builder: sources ∩ decodes at the chosen output
+  const kind = batchKind(), subs = !!s.selected_subs;
+  const srcs4k = ((s.source_codecs_by_res||{})["4k"])||["hevc"];
+  let runs = 0;
+  gpus.forEach(g=>{
+    const box = document.getElementById("bpdevs").querySelector('input[data-i="'+g.idx+'"]');
+    if(box && !box.checked) return;
+    if((g.codecs||[]).indexOf(s.selected_codec||"h264")<0) return;
+    if(kind==="sweep")
+      runs += srcs4k.filter(c=>(g.decodes||[]).indexOf(c)>=0 && !(subs&&c==="hdr")).length;
+    else if((g.decodes||[]).indexOf(s.selected_input||"hevc")>=0) runs += 1;
+  });
+  document.getElementById("bpnote").textContent =
+    runs+" run(s), strictly one at a time with a cool-down between"
+    +(subs&&kind==="sweep" ? " · subtitles ON — every run burns subs, HDR sits out" : "")
+    +(runs>6 ? " · this can take a while on fast GPUs" : "");
+  panel.querySelector(".bps").disabled = runs===0;
+}
+function startBatch(){
+  const idxs=[]; document.querySelectorAll("#batchpanel .bpd input").forEach(c=>{if(c.checked)idxs.push(c.dataset.i);});
+  if(!idxs.length) return;
+  document.getElementById("batchpanel").classList.remove("show");
+  post("/batch?d="+idxs.join(",")+"&kind="+batchKind());
+}
+function submitBatch(){ post("/submitbatch"); }
+let BTAB = 0;
+function batchDetailHtml(f){
+  if(!f) return "";
+  const streaming = f.mode==="streaming";
+  const big = streaming ? (f.max_sustained!=null?f.max_sustained:"—") : (fmt(f.single_stream)+"×");
+  const cap = streaming ? "max sustained streams" : "realtime per file";
+  let note = "";
+  if(f.capped && f.limit_reason==="memory") note = "hit its VRAM ceiling — engine throughput ≈"+(f.projected||"?")+"× realtime";
+  else if(f.capped) note = "driver session cap — engine throughput ≈"+(f.projected||"?")+"× realtime";
+  const lv = (f.per_level||[]).map(L=>'<div class="bd-lv"><span>'+L.n+' stream'+(L.n>1?'s':'')
+    +'</span><span>worst '+fmt(L.worst)+'×</span><span>combined '+fmt(L.combined)+'×</span></div>').join("");
+  const spec = [f.driver?("driver "+escHtml(f.driver)):null, f.ram?escHtml(f.ram):null,
+    f.cpu?escHtml(f.cpu):null, f.kernel?("kernel "+escHtml(f.kernel)):null].filter(Boolean).join(" · ");
+  return '<div class="bd-big">'+big+'</div><div class="bd-cap">'+cap+'</div>'
+    +'<div class="bd-prof">'+escHtml(f.gpu)+' — '+escHtml(f.profile||"")
+    +(f.comparable?'':' · <span class="bsub local">local-only</span>')+'</div>'
+    +(note?'<div class="bd-note">'+note+'</div>':'')
+    +effBlock(f)
+    +'<div class="bd-lvh"><span>Level</span><span>Worst</span><span>Combined</span></div>'+lv
+    +(spec?'<div class="bd-spec">'+spec+'</div>':'');
+}
+function renderBatchTabs(s){
+  const rows = s.batch_results||[];
+  const el = document.getElementById("btabs");
+  const ok = rows.filter(r=>!r.error && r.full);
+  if(!ok.length){ el.classList.remove("show"); return; }
+  el.classList.add("show");
+  if(BTAB>=ok.length) BTAB=0;
+  el.querySelector(".tabstrip").innerHTML = ok.map((r,i)=>{
+    const label = escHtml((r.gpu||"").split(" ")[0])+" · "+(CODEC_LABEL[r.input_codec]||r.input_codec||"").split(" ")[0]+(r.subs?"+subs":"");
+    return '<button class="btab'+(i===BTAB?' on':'')+'" data-t="'+i+'">'+label+'</button>';
+  }).join("");
+  el.querySelectorAll(".btab").forEach(b=>b.addEventListener("click",()=>{BTAB=parseInt(b.dataset.t,10);renderBatchTabs(LAST);}));
+  document.getElementById("btabdetail").innerHTML = batchDetailHtml(ok[BTAB].full);
+}
 
 function resultText(){
   const r = LAST.result; if(!r) return "";

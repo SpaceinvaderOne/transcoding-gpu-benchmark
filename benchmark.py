@@ -90,7 +90,7 @@ UNRAID_VER_FILE = _env("UNRAID_VER_FILE", "/unraid-version")  # optional RO moun
 # will move to gpu.spaceinvader.one once the domain's DNS is on Cloudflare. Setting the env var
 # to empty/whitespace disables submission entirely (the Submit button never shows).
 SUBMIT_URL      = _env("SUBMIT_URL", "https://gpu.spaceinvader.one/api/submit").strip()
-TOOL_VERSION    = "1.1"
+TOOL_VERSION    = "1.2"
 
 # SMBIOS Memory Device "Memory Type" enum (subset)
 MEM_TYPE = {0x13: "DDR", 0x14: "DDR2", 0x18: "DDR3", 0x1A: "DDR4", 0x1E: "LPDDR",
@@ -899,6 +899,44 @@ def batch_skip_reason(gpu, input_codec, codec):
     if codec not in gpu.get("codecs", []):
         return f"can't encode {codec.upper()}"
     return None
+
+
+def build_batch_jobs(devices, kind, output_codec, subs_on, selected_input):
+    """Expand a batch request into sequential jobs [{gpu, input_codec, subs}] + skipped rows.
+    kind "sweep" = every supported 4K source per device at the chosen output (device-grouped,
+    shipped order) — the "how does this GPU handle every kind of source?" batch. kind
+    "current" = the selected (source, subs) on each device — the classic cross-device compare.
+    The subtitles toggle applies to every job EXCEPT hdr (the combined chain is unsupported in
+    v1), so a subs sweep shows HDR as visibly skipped rather than silently missing. Parallel
+    execution is deliberately not offered: concurrent devices contend for CPU feeding, PCIe and
+    RAM bandwidth and destroy power attribution (iGPU+CPU literally share silicon)."""
+    jobs, skipped = [], []
+    for gpu in devices:
+        if not gpu.get("available"):
+            skipped.append({"gpu": gpu["name"], "reason": "not testable"})
+            continue
+        if output_codec not in gpu.get("codecs", []):
+            skipped.append({"gpu": gpu["name"], "reason": f"can't encode {output_codec.upper()}"})
+            continue
+        if kind == "sweep":
+            for src in SOURCE_CODECS_BY_RES["4k"]:
+                if src not in gpu.get("decodes", []):
+                    skipped.append({"gpu": gpu["name"],
+                                    "reason": batch_skip_reason(gpu, src, output_codec)})
+                    continue
+                if src == "hdr" and subs_on:
+                    skipped.append({"gpu": gpu["name"],
+                                    "reason": "HDR can't combine with subtitle burn-in"})
+                    continue
+                jobs.append({"gpu": gpu, "input_codec": src, "subs": subs_on})
+        else:  # current selection across devices
+            reason = batch_skip_reason(gpu, selected_input, output_codec)
+            if reason:
+                skipped.append({"gpu": gpu["name"], "reason": reason})
+                continue
+            jobs.append({"gpu": gpu, "input_codec": selected_input,
+                         "subs": subs_on and selected_input != "hdr"})
+    return jobs, skipped
 
 
 def profile_label(source_res, input_codec, target_res, codec, custom_source, subs, ten_bit):
@@ -2478,8 +2516,13 @@ def start_run():
         return True
 
 
-def _batch_row(gpu, result):
-    """Trimmed per-device summary for the batch comparison table."""
+BATCH_COOLDOWN = float(_env("BATCH_COOLDOWN", "15"))   # seconds between batch jobs (dGPUs stay
+                                                       # boosted after a ramp — the NEXT run's
+                                                       # idle-power baseline needs a breather)
+
+
+def _batch_row(gpu, result, job=None):
+    """Per-run summary for the batch table + the FULL result (tab detail views + submit-all)."""
     return {"gpu": gpu["name"], "vendor": gpu["vendor"], "is_cpu": result.get("is_cpu", False),
             "error": False, "max_sustained": result.get("max_sustained"),
             "capped": result.get("capped"), "projected": result.get("projected"),
@@ -2489,42 +2532,68 @@ def _batch_row(gpu, result):
             "watts_per_stream": result.get("watts_per_stream"),
             "peak_power_w": result.get("peak_power_w"),
             "power_estimated": result.get("power_estimated"),
-            "ten_bit": result.get("ten_bit")}
+            "ten_bit": result.get("ten_bit"),
+            "profile": result.get("profile"), "input_codec": result.get("input_codec"),
+            "subs": bool(result.get("subs_burn")),
+            "comparable": bool(result.get("comparable")),
+            "submitted": False, "full": result}
 
 
-def batch_run(devices, codec, input_codec, source_res, target_res, mode, subs=False):
-    """Test-all: run the SAME profile on every eligible device sequentially, then publish the
-    comparison table. Skips the interactive busy gate (would stall a batch); a mid-run cancel
-    aborts the current run and the whole batch; a per-device error records a row and moves on."""
+def _job_label(job, codec, source_res, target_res, mode):
+    p = profile_label(source_res, job["input_codec"], target_res, codec, False,
+                      job["subs"], False)
+    return f"{job['gpu']['name']} · {p}"
+
+
+def batch_run(jobs, codec, source_res, target_res, mode):
+    """Run a batch of jobs [{gpu, input_codec, subs}] STRICTLY sequentially with a cool-down
+    between runs (concurrent devices contend for CPU feeding, PCIe and RAM bandwidth and ruin
+    power attribution — sequential is the only honest mode). Skips the interactive busy gate
+    (would stall a batch); a mid-run cancel aborts the whole batch; a per-job error records a
+    row and moves on."""
     rows = []
     try:
-        for i, gpu in enumerate(devices):
-            publish(batch_done=i, message=f"Testing {gpu['name']} ({i + 1} of {len(devices)})…")
-            ten_bit = (ten_bit_output(source_res, target_res, input_codec, codec)
+        for i, job in enumerate(jobs):
+            label = _job_label(job, codec, source_res, target_res, mode)
+            if i > 0 and BATCH_COOLDOWN > 0:
+                publish(message=f"Cooling down {BATCH_COOLDOWN:.0f}s before run "
+                                f"{i + 1} of {len(jobs)}…")
+                if _ABORT.wait(BATCH_COOLDOWN):
+                    _publish_cancelled()
+                    publish(batch=False, batch_queue=[], batch_done=0, batch_results=[],
+                            batch_skipped=[], submitted=False)
+                    return
+            publish(batch_done=i, message=f"Run {i + 1} of {len(jobs)}: {label}…")
+            gpu = job["gpu"]
+            ten_bit = (ten_bit_output(source_res, target_res, job["input_codec"], codec)
                        and codec in gpu.get("codecs10", []))
-            benchmark(gpu, codec, input_codec, None, source_res, target_res, ten_bit, mode,
-                      skip_busy_warn=True, announce_done=False, subs=subs)
+            benchmark(gpu, codec, job["input_codec"], None, source_res, target_res, ten_bit,
+                      mode, skip_busy_warn=True, announce_done=False, subs=job["subs"])
             with STATE_LOCK:
                 ui, result = STATE.get("ui"), STATE.get("result")
             if ui == "idle":                       # cancelled mid-batch → back to the picker
-                publish(batch=False, batch_queue=[], batch_done=0, batch_results=[], batch_skipped=[], submitted=False)
+                publish(batch=False, batch_queue=[], batch_done=0, batch_results=[],
+                        batch_skipped=[], submitted=False)
                 return
             if ui == "error" or not result:
-                rows.append({"gpu": gpu["name"], "vendor": gpu["vendor"], "error": True})
+                rows.append({"gpu": gpu["name"], "vendor": gpu["vendor"], "error": True,
+                             "profile": label.split(" · ", 1)[-1]})
                 publish(ui="running", phase="preparing")   # keep the batch going
             else:
-                rows.append(_batch_row(gpu, result))
+                rows.append(_batch_row(gpu, result, job))
             publish(batch_results=list(rows), batch_done=i + 1)
         publish(ui="done", phase="done", batch_results=rows,
-                message=f"Tested {len(rows)} device(s) — comparison below.")
+                message=f"Batch complete — {len(rows)} run(s), summary below.")
     except Exception as e:
         print(f"[batch] error: {e}", flush=True)
         publish(ui="error", phase="error", batch=False, message=f"Batch error: {e}")
 
 
-def start_all():
-    """Kick off a test-all-devices batch for the current mode + codec pair. Idle only; shipped
-    clips only (a custom file would make devices incomparable and can't be decoded everywhere)."""
+def start_batch(device_idxs=None, kind="current"):
+    """Kick off a batch: kind "sweep" = every supported 4K source per selected device at the
+    current output; kind "current" = the current selection across the selected devices.
+    device_idxs None ⇒ all available. Idle only; shipped clips only (a custom file can't be
+    decoded everywhere so cross-device comparison would be apples-to-oranges)."""
     with RUN_LOCK:
         with STATE_LOCK:
             cur = STATE.get("ui")
@@ -2541,27 +2610,23 @@ def start_all():
             source_res, target_res = "4k", "1080p"
         else:
             subs = False
-        if input_codec == "hdr":
-            subs = False                             # HDR + burn-in combined is unsupported (v1)
-        if source_res not in SOURCE_RES:
-            source_res = "4k"
-        if input_codec not in SOURCE_CODECS_BY_RES.get(source_res, ("h264",)):
-            input_codec = "h264" if source_res == "1080p" else "hevc"
-        if target_res not in target_res_options(source_res):
-            target_res = "1080p" if "1080p" in target_res_options(source_res) else source_res
-        devices = [g for g in _available(_DETECTED) if batch_eligible(g, input_codec, codec)]
-        if not devices:
+        if kind == "sweep":
+            source_res = "4k"                     # sweeps cover the 4K (leaderboard) source set
+            if target_res not in target_res_options("4k"):
+                target_res = "1080p"
+        avail = _available(_DETECTED)
+        if device_idxs is not None:
+            avail = [g for g in avail if g["idx"] in device_idxs]
+        jobs, skipped = build_batch_jobs(avail, kind, codec, subs, input_codec)
+        if not jobs:
             return False
-        skipped = [{"gpu": g["name"], "reason": batch_skip_reason(g, input_codec, codec)}
-                   for g in _DETECTED if batch_skip_reason(g, input_codec, codec)]
+        labels = [_job_label(j, codec, source_res, target_res, mode) for j in jobs]
         publish(ui="preparing", phase="preparing", batch=True,
-                batch_queue=[g["name"] for g in devices], batch_done=0, batch_results=[],
-                batch_skipped=skipped,
-                selected_input=input_codec,
-                selected_source_res=source_res, selected_target_res=target_res,
-                message=f"Testing all {len(devices)} devices…")
+                batch_queue=labels, batch_done=0, batch_results=[],
+                batch_skipped=skipped, submitted=False,
+                message=f"Batch: {len(jobs)} run(s) queued…")
         threading.Thread(target=batch_run,
-                         args=(devices, codec, input_codec, source_res, target_res, mode, subs),
+                         args=(jobs, codec, source_res, target_res, mode),
                          daemon=True).start()
         return True
 
@@ -2654,18 +2719,12 @@ def submission_envelope(result, install_id, ts=None):
             "submitted_at": (ts if ts is not None else int(time.time())), "result": result}
 
 
-def submit_result():
-    """POST the submission envelope to the leaderboard endpoint; only ever called for a
-    comparable result (UI gates the button). Success ⇒ submitted=true (button becomes ✓)."""
-    with STATE_LOCK:
-        result = STATE.get("result")
-        already = STATE.get("submitted")
-    if not SUBMIT_URL or not result or already:
-        return False
+def _post_submission(result):
+    """POST one result's envelope. Returns (ok, reason) — reason is the SERVER'S rejection
+    message when available (a bare "HTTP 400" told the user, and us, nothing)."""
     if not result.get("comparable"):
-        return False                      # never submit local-only runs, whatever the UI says
+        return False, "not comparable"    # never submit local-only runs, whatever the UI says
     try:
-        import urllib.request
         data = json.dumps(submission_envelope(result, load_or_create_install_id())).encode()
         req = urllib.request.Request(SUBMIT_URL, data=data,
                                      headers={"Content-Type": "application/json",
@@ -2673,24 +2732,76 @@ def submit_result():
                                               # default Python-urllib UA — identify honestly
                                               "User-Agent": f"gpu-benchmark/{TOOL_VERSION}"})
         with urllib.request.urlopen(req, timeout=10) as resp:
-            ok = (resp.status == 200)
-        if ok:
-            publish(submitted=True, message="Submitted to the leaderboard — thank you!")
-            return True
-        publish(message="Submit rejected by the server.")
-        return False
+            if resp.status == 200:
+                return True, ""
+        return False, "rejected by the server"
     except urllib.error.HTTPError as e:
-        # surface the SERVER'S reason, not just the status code — a bare "HTTP 400" told the
-        # user (and us) nothing when a validation rule fired
         try:
             reason = json.loads(e.read()[:1024]).get("error", "")
         except Exception:
             reason = ""
-        publish(message=f"Submit rejected: {reason or e}")
-        return False
+        return False, reason or str(e)
     except Exception as e:
-        publish(message=f"Submit failed: {e}")
+        return False, str(e)
+
+
+def submit_result():
+    """Submit the current single-run result (UI gates the button on comparable)."""
+    with STATE_LOCK:
+        result = STATE.get("result")
+        already = STATE.get("submitted")
+    if not SUBMIT_URL or not result or already:
         return False
+    ok, reason = _post_submission(result)
+    if ok:
+        publish(submitted=True, message="Submitted to the leaderboard — thank you!")
+        return True
+    publish(message=f"Submit rejected: {reason}" if reason else "Submit failed.")
+    return False
+
+
+_SUBMITTING_BATCH = threading.Event()
+
+
+def _submit_batch_thread():
+    """Submit every retained comparable batch result, one per second, updating each row's
+    submitted/submit_error so the table shows per-row ✓/✗ live."""
+    try:
+        with STATE_LOCK:
+            rows = [dict(r) for r in STATE.get("batch_results", [])]
+        sent = 0
+        for i, row in enumerate(rows):
+            full = row.get("full")
+            if not full or not full.get("comparable") or row.get("submitted"):
+                continue
+            ok, reason = _post_submission(full)
+            row["submitted"] = ok
+            if not ok:
+                row["submit_error"] = reason
+            else:
+                sent += 1
+            rows[i] = row
+            publish(batch_results=list(rows))
+            time.sleep(1)                 # gentle on the shared rate limit
+        publish(batch_results=rows,
+                message=f"Submitted {sent} result(s) to the leaderboard — thank you!"
+                        if sent else "Nothing new to submit.")
+    finally:
+        _SUBMITTING_BATCH.clear()
+
+
+def submit_batch():
+    """POST every comparable result from the finished batch (button under the summary table)."""
+    with STATE_LOCK:
+        cur = STATE.get("ui")
+        rows = STATE.get("batch_results", [])
+    if cur != "done" or not SUBMIT_URL or _SUBMITTING_BATCH.is_set():
+        return False
+    if not any(r.get("full", {}).get("comparable") and not r.get("submitted") for r in rows):
+        return False
+    _SUBMITTING_BATCH.set()
+    threading.Thread(target=_submit_batch_thread, daemon=True).start()
+    return True
 
 
 # --------------------------------------------------------------- gpu telemetry
@@ -3124,8 +3235,19 @@ class Handler(BaseHTTPRequestHandler):
             ok = select_subs(_query_str(self.path, "b") == "1")
         elif self.path.startswith("/fetchclips"):
             ok = start_fetch_clips()
-        elif self.path.startswith("/startall"):   # must precede the "/start" prefix match
-            ok = start_all()
+        elif self.path.startswith("/startall"):   # legacy route (old tabs) — current-kind batch
+            ok = start_batch(None, "current")
+        elif self.path.startswith("/batch"):
+            d = _query_str(self.path, "d")
+            idxs = None
+            if d:
+                try:
+                    idxs = [int(x) for x in d.split(",") if x != ""]
+                except ValueError:
+                    idxs = None
+            ok = start_batch(idxs, _query_str(self.path, "kind") or "current")
+        elif self.path.startswith("/submitbatch"):
+            ok = submit_batch()
         elif self.path.startswith("/start"):
             ok = start_run()
         elif self.path.startswith("/continue"):

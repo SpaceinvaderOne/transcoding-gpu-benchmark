@@ -1033,5 +1033,57 @@ class TestRunComparable(unittest.TestCase):
             self.assertFalse(benchmark.is_run_comparable(**{**self.ARGS, k: v}), k)
 
 
+class TestBatchJobs(unittest.TestCase):
+    """A batch is a list of {gpu, input_codec, subs} jobs at the current output. Sweeps cover
+    every supported 4K source per device (device-grouped, shipped order); the subtitles toggle
+    applies to every job EXCEPT hdr, which sits out of a subs sweep visibly."""
+    IGPU = {"idx": 0, "name": "iGPU", "vendor": "intel", "available": True,
+            "decodes": ["h264", "hevc", "av1", "hdr"], "codecs": ["h264", "hevc"]}
+    DGPU = {"idx": 1, "name": "dGPU", "vendor": "nvidia", "available": True,
+            "decodes": ["h264", "hevc", "av1", "hdr"], "codecs": ["h264", "hevc", "av1"]}
+    AMD = {"idx": 2, "name": "amd", "vendor": "amd", "available": True,
+           "decodes": ["h264", "hevc", "av1"], "codecs": ["h264", "hevc", "av1"]}  # no hdr
+    CPU = {"idx": 3, "name": "cpu", "vendor": "cpu", "available": True,
+           "decodes": ["h264", "hevc", "av1", "hdr"], "codecs": ["h264", "hevc", "av1"]}
+
+    def test_sweep_all_sources_device_grouped(self):
+        jobs, skipped = benchmark.build_batch_jobs([self.IGPU, self.AMD], "sweep", "h264",
+                                                   False, "hevc")
+        labels = [(j["gpu"]["name"], j["input_codec"], j["subs"]) for j in jobs]
+        self.assertEqual(labels, [
+            ("iGPU", "h264", False), ("iGPU", "hevc", False), ("iGPU", "av1", False),
+            ("iGPU", "hdr", False),
+            ("amd", "h264", False), ("amd", "hevc", False), ("amd", "av1", False)])
+        # the AMD lacks HDR tone-mapping — that gap must be VISIBLE, not silently missing
+        self.assertEqual(len(skipped), 1)
+        self.assertEqual(skipped[0]["gpu"], "amd")
+        self.assertIn("tone-map", skipped[0]["reason"])
+
+    def test_subs_sweep_skips_hdr_with_reason(self):
+        jobs, skipped = benchmark.build_batch_jobs([self.IGPU], "sweep", "h264", True, "hevc")
+        self.assertEqual([(j["input_codec"], j["subs"]) for j in jobs],
+                         [("h264", True), ("hevc", True), ("av1", True)])
+        self.assertEqual(len(skipped), 1)
+        self.assertIn("HDR", skipped[0]["reason"])
+
+    def test_device_that_cannot_encode_output_is_skipped(self):
+        jobs, skipped = benchmark.build_batch_jobs([self.IGPU, self.DGPU], "sweep", "av1",
+                                                   False, "hevc")
+        self.assertTrue(all(j["gpu"]["name"] == "dGPU" for j in jobs))
+        self.assertEqual(skipped[0]["gpu"], "iGPU")
+        self.assertIn("encode", skipped[0]["reason"])
+
+    def test_current_kind_uses_selection(self):
+        jobs, skipped = benchmark.build_batch_jobs([self.IGPU, self.CPU], "current", "h264",
+                                                   True, "av1")
+        self.assertEqual([(j["gpu"]["name"], j["input_codec"], j["subs"]) for j in jobs],
+                         [("iGPU", "av1", True), ("cpu", "av1", True)])
+
+    def test_current_kind_skips_nondecoding_device(self):
+        jobs, skipped = benchmark.build_batch_jobs([self.AMD], "current", "h264", False, "hdr")
+        self.assertEqual(jobs, [])
+        self.assertIn("tone-map", skipped[0]["reason"])
+
+
 if __name__ == "__main__":
     unittest.main()
