@@ -2,7 +2,11 @@
 # validated multi-vendor ffmpeg (jellyfin-ffmpeg) + Intel/AMD/NVIDIA driver stack.
 # The Jellyfin media server itself is NEVER started: we override the entrypoint
 # so the container boots straight into our benchmark + scoreboard.
-FROM jellyfin/jellyfin:latest
+# PINNED BY DIGEST (not :latest): every validated number — capability probes, tone-map
+# chains, leaderboard baselines — was measured on this exact ffmpeg/driver stack, and a
+# silent base bump would quietly re-baseline the whole community. Bumping the base is a
+# deliberate act: update the digest, re-validate on all three vendors, ship as a new version.
+FROM jellyfin/jellyfin@sha256:aefb67e6a7ff1debdd154a78a7bbb780fd0c873d8639210a7f6a2016ad2b35db
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
