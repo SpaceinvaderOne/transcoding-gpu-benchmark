@@ -89,7 +89,7 @@ UNRAID_VER_FILE = _env("UNRAID_VER_FILE", "/unraid-version")  # optional RO moun
 # leaderboard endpoint — hardcoded by policy (changed only by shipping a new image version);
 # will move to gpu.spaceinvader.one once the domain's DNS is on Cloudflare. Setting the env var
 # to empty/whitespace disables submission entirely (the Submit button never shows).
-SUBMIT_URL      = _env("SUBMIT_URL", "https://gpu-leaderboard.spaceinvaderone.workers.dev/api/submit").strip()
+SUBMIT_URL      = _env("SUBMIT_URL", "https://gpu.spaceinvader.one/api/submit").strip()
 TOOL_VERSION    = "1.0"
 
 # SMBIOS Memory Device "Memory Type" enum (subset)
