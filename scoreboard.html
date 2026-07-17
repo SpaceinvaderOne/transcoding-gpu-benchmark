@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>GPU Transcode Benchmark</title>
+<title>Transcoding GPU Benchmark</title>
 <style>
   :root{
     --bg:#0a0e14; --panel:#121823; --ink:#e8eef7; --muted:#7b8aa0;
@@ -292,7 +292,7 @@
 <body>
   <header>
     <div>
-      <h1>GPU Transcode Benchmark</h1>
+      <h1>Transcoding GPU Benchmark</h1>
       <div class="hwline" id="hwline"></div>
     </div>
     <div class="profile"><b id="sreslbl">4K</b> <b id="inlbl">HEVC</b>&nbsp;→&nbsp;<b id="treslbl">1080p</b> · <b id="codeclbl">H.264</b> · <b id="bitrate">8M</b> · <b id="encoder">—</b></div>
@@ -340,7 +340,7 @@
   </div>
 
   <div id="ready">
-    <div class="cap">GPU Transcode Benchmark</div>
+    <div class="cap">Transcoding GPU Benchmark</div>
     <div class="rtitle" id="rtitle">Choose a GPU to test</div>
     <div class="modetoggle">
       <button class="modebtn" data-mode="streaming" onclick="selectMode('streaming')">How many streams</button>
@@ -1222,7 +1222,7 @@ function resultText(){
         : ("≈"+r.watts_per_stream+" W/stream"+(r.power_estimated?" (est)":"")+
            (r.streams_per_watt!=null?(" · "+fmt(r.streams_per_watt)+" streams/W"):"")))
     : "";
-  return ["GPU Transcode Benchmark — "+r.gpu,
+  return ["Transcoding GPU Benchmark — "+r.gpu,
     "Result: "+head+"  ["+r.profile+", "+(CODEC_LABEL[r.codec]||r.codec)+" "+r.bitrate+"]",
     "Single-stream "+fmt(r.single_stream)+"× · peak combined "+fmt(r.peak_combined)+"×"+(eff?(" · "+eff):""),
     (r.power_insight||""),
@@ -1253,7 +1253,7 @@ function downloadCard(){
   const x=c.getContext("2d"); const acc=VENDOR_COLORS[r.vendor]||"#4aa3ff";
   x.fillStyle="#0a0e14"; x.fillRect(0,0,W,H);
   x.fillStyle=acc; x.fillRect(0,0,W,10);
-  x.fillStyle="#7b8aa0"; x.font="600 22px Segoe UI,sans-serif"; x.fillText("GPU TRANSCODE BENCHMARK",40,62);
+  x.fillStyle="#7b8aa0"; x.font="600 22px Segoe UI,sans-serif"; x.fillText("TRANSCODING GPU BENCHMARK",40,62);
   x.fillStyle="#e8eef7"; x.font="800 38px Segoe UI,sans-serif"; x.fillText(r.gpu,40,110);
   let y=420;
   if(r.mode==="convert"){

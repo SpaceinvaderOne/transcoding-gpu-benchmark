@@ -1,4 +1,4 @@
-// GPU Transcode Benchmark leaderboard — Cloudflare Worker + D1.
+// Transcoding GPU Benchmark leaderboard — Cloudflare Worker + D1.
 // Implements docs/superpowers/specs/2026-07-07-leaderboard-submission-contract.md exactly:
 //   POST /api/submit         — validated envelope ingest (upsert best per install+gpu+profile)
 //   GET  /api/top            — median-per-GPU board rows (?profile=..., canonical by default)
@@ -337,7 +337,7 @@ async function handleAdmin(request, url, env, action) {
 // ---- the public page ---------------------------------------------------------------------------
 const PAGE = `<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>GPU Transcode Benchmark — Leaderboard</title><style>
+<title>Transcoding GPU Benchmark — Leaderboard</title><style>
 :root{--bg:#0a0e14;--panel:#121823;--ink:#e8eef7;--muted:#7b8aa0;--accent:#4aa3ff;--green:#2ecc71}
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:radial-gradient(1000px 700px at 50% 0%,#10243b 0%,#06101c 70%);color:var(--ink);
@@ -418,7 +418,7 @@ td.effcell{color:var(--green)}
 .showall button{background:#0e1928;border:1px solid #2c3e55;border-radius:999px;padding:8px 18px;font-size:13.5px;color:var(--accent);cursor:pointer}
 .showall button:hover{border-color:var(--accent)}
 </style></head><body><div class="wrap">
-<div class="cap">GPU Transcode Benchmark</div><h1>Leaderboard</h1>
+<div class="cap">Transcoding GPU Benchmark</div><h1>Leaderboard</h1>
 <div class="sub" id="sub">Simultaneous <b>4K HEVC → 1080p H.264 (8M)</b> streams at ≥ 1.0× realtime · median of community submissions · click a row for the breakdown</div>
 <div class="pillrows" id="pillrows" style="display:none">
   <div class="prow"><span class="plab">Source</span><span class="pset" id="srcs"></span></div>
@@ -433,7 +433,7 @@ td.effcell{color:var(--green)}
 <table id="t"><thead><tr><th></th><th>GPU</th><th class="sortable" data-k="median_streams">Streams (median)<span class="arr" id="a-median_streams"></span></th><th class="sortable" data-k="best_streams">Best<span class="arr" id="a-best_streams"></span></th><th class="sortable eff" data-k="median_wps">≈W/stream<span class="arr" id="a-median_wps"></span></th><th class="sortable" data-k="count">Runs<span class="arr" id="a-count"></span></th></tr></thead>
 <tbody id="tb"><tr><td colspan="6" class="empty">Loading…</td></tr></tbody></table>
 <div class="showall" id="showall" style="display:none"><button onclick="SHOWALL=true;renderRows()"></button></div>
-<div class="foot">Run it on your own Unraid server — search <b>GPU Stream Benchmark</b> in Community Apps.</div>
+<div class="foot">Run it on your own Unraid server — search <b>Transcoding GPU Benchmark</b> in Community Apps.</div>
 </div><script>
 const esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const median=a=>{const s=[...a].sort((x,y)=>x-y);return s.length?(s.length%2?s[(s.length-1)/2]:(s[s.length/2-1]+s[s.length/2])/2):null};
