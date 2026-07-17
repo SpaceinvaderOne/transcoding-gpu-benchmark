@@ -19,7 +19,11 @@ const MAX_BODY = 32 * 1024;
 const json = (obj, status = 200, extra = {}) =>
   new Response(JSON.stringify(obj), { status, headers: { "Content-Type": "application/json",
     "Cache-Control": "no-store", ...extra } });
-const jsonPub = (obj, status = 200) => json(obj, status, { "Access-Control-Allow-Origin": "*" });
+// public GETs are EDGE-CACHED 60 s (browsers always revalidate): a video-scale traffic spike
+// hits Cloudflare's cache instead of a D1 json_extract scan per visitor. The PAGE stays
+// no-store — that asymmetry is what keeps the historical page/API version-skew bug dead.
+const jsonPub = (obj, status = 200) => json(obj, status, { "Access-Control-Allow-Origin": "*",
+  "Cache-Control": "public, s-maxage=60, max-age=0" });
 const bad = (error, status = 400, extra = {}) => json({ ok: false, error }, status, extra);
 
 async function sha256hex(s) {
@@ -267,6 +271,14 @@ async function handleDetail(url, env) {
   // All fields are ALLOWLISTED — never install_id, ip_hash or the raw envelope.
   const gpu = url.searchParams.get("gpu");
   if (!gpu) return bad("missing gpu");
+  // ?profiles=1 — the "your GPU across all boards" strip: which profiles does this card
+  // appear on, and with how many runs (allowlisted aggregate only, like everything here)
+  if (url.searchParams.get("profiles") === "1") {
+    const { results } = await env.DB.prepare(
+      `SELECT profile, COUNT(*) AS count FROM submissions
+       WHERE gpu = ? AND hidden = 0 GROUP BY profile ORDER BY count DESC`).bind(gpu).all();
+    return jsonPub({ gpu, profiles: results });
+  }
   const profile = url.searchParams.get("profile") || CANONICAL;
   const gen = url.searchParams.get("gen");         // iGPU entity filter (DDR4/DDR5/unknown)
   const cap = url.searchParams.get("cap");         // entity cap-config filter (1=session-capped)
@@ -380,13 +392,47 @@ tr.detail>td{background:#0a111d;padding:18px 22px}
 .prof:hover{color:var(--ink);border-color:var(--accent)}
 .prof.on{background:var(--accent);color:#04121f;font-weight:700;border-color:var(--accent)}
 .prof small{opacity:.75;margin-left:5px}
+.pillrows{margin:0 0 14px}
+.prow{display:flex;align-items:center;justify-content:center;gap:8px;margin-bottom:8px;flex-wrap:wrap}
+.plab{color:var(--muted);font-size:12px;letter-spacing:.12em;text-transform:uppercase;min-width:58px;text-align:right}
+.pset{display:flex;gap:8px;flex-wrap:wrap}
+.prof.dis{opacity:.35;cursor:default;pointer-events:none}
+.prof.subs{border-style:dashed}
+.toolbar{display:flex;align-items:center;justify-content:center;gap:10px;flex-wrap:wrap;margin:0 0 14px}
+#q{background:#0e1928;border:1px solid #2c3e55;border-radius:999px;padding:8px 16px;font-size:14px;color:var(--ink);width:230px;outline:none}
+#q:focus{border-color:var(--accent)}
+.vchip{background:#0e1928;border:1px solid #2c3e55;border-radius:999px;padding:6px 12px;font-size:12.5px;color:var(--muted);cursor:pointer;margin-left:4px}
+.vchip.on{background:#1c3752;color:var(--ink);border-color:var(--accent)}
+.vtbtn{background:#0e1928;border:1px solid #2c3e55;border-radius:999px;padding:6px 12px;font-size:12.5px;color:var(--muted);cursor:pointer}
+.vtbtn.on{background:var(--accent);color:#04121f;font-weight:700;border-color:var(--accent)}
+.xprof{background:#0f2233;border:1px solid #25405d;border-radius:10px;padding:8px 14px;font-size:13px;color:var(--muted);margin:0 0 12px}
+.xprof a{color:var(--accent);cursor:pointer;text-decoration:none}
+th.sortable{cursor:pointer;user-select:none}
+th.sortable:hover{color:var(--ink)}
+.arr{margin-left:4px;font-size:10px}
+th.eff{color:var(--green)}
+td.effcell{color:var(--green)}
+.effbadge{display:inline-block;font-size:10px;letter-spacing:.05em;text-transform:uppercase;border-radius:5px;padding:1px 6px;margin-left:6px;background:#123524;color:#2ecc71;white-space:nowrap}
+.ccount,.prov{white-space:nowrap}
+.showall{margin:14px 0 0}
+.showall button{background:#0e1928;border:1px solid #2c3e55;border-radius:999px;padding:8px 18px;font-size:13.5px;color:var(--accent);cursor:pointer}
+.showall button:hover{border-color:var(--accent)}
 </style></head><body><div class="wrap">
 <div class="cap">GPU Transcode Benchmark</div><h1>Leaderboard</h1>
 <div class="sub" id="sub">Simultaneous <b>4K HEVC → 1080p H.264 (8M)</b> streams at ≥ 1.0× realtime · median of community submissions · click a row for the breakdown</div>
-<div class="profs" id="profs"></div>
-<div class="vtoggle"><button id="vt" onclick="toggleView()">Show all runs &amp; failure detail</button></div>
-<table id="t"><thead><tr><th></th><th>GPU</th><th>Streams (median)</th><th>Best</th><th>≈W/stream</th><th>Runs</th></tr></thead>
+<div class="pillrows" id="pillrows" style="display:none">
+  <div class="prow"><span class="plab">Source</span><span class="pset" id="srcs"></span></div>
+  <div class="prow"><span class="plab">Output</span><span class="pset" id="outs"></span></div>
+</div>
+<div class="toolbar">
+  <input id="q" type="search" placeholder="🔍 Find your GPU…" autocomplete="off">
+  <span class="vchips" id="vchips"></span>
+  <button id="vt" class="vtbtn" onclick="toggleView()">Show all runs &amp; failure detail</button>
+</div>
+<div id="xprof" class="xprof" style="display:none"></div>
+<table id="t"><thead><tr><th></th><th>GPU</th><th class="sortable" data-k="median_streams">Streams (median)<span class="arr" id="a-median_streams"></span></th><th class="sortable" data-k="best_streams">Best<span class="arr" id="a-best_streams"></span></th><th class="sortable eff" data-k="median_wps">≈W/stream<span class="arr" id="a-median_wps"></span></th><th class="sortable" data-k="count">Runs<span class="arr" id="a-count"></span></th></tr></thead>
 <tbody id="tb"><tr><td colspan="6" class="empty">Loading…</td></tr></tbody></table>
+<div class="showall" id="showall" style="display:none"><button onclick="SHOWALL=true;renderRows()"></button></div>
 <div class="foot">Run it on your own Unraid server — search <b>GPU Stream Benchmark</b> in Community Apps.</div>
 </div><script>
 const esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
@@ -529,51 +575,178 @@ async function toggle(tr, gpu, gen, cap){
     det.firstChild.innerHTML=detailHtml(d);
   }catch(e){ det.firstChild.textContent="Could not load details."; }
 }
-let ALLVIEW=false, ROWS=[];
+let ALLVIEW=false, ROWS=[], SHOWALL=false, Q="", VEND="";
+let SORT={k:"median_streams",dir:-1};                    // default = performance ranking
+const TOPN=25;
 function toggleView(){
   ALLVIEW=!ALLVIEW;
   document.getElementById("vt").classList.toggle("on",ALLVIEW);
   renderRows();
 }
+// ---- two-row workload navigation: profiles parsed into (source, output, subs) ----------------
+// Safe to parse: the server DERIVES/validates every stored profile string from structured
+// fields, so the format is a guarantee, not a convention.
+let PROFILES=[];                                          // [{profile,count,src,out,subs}]
+let SEL={src:"HEVC",out:"H264",subs:false};
+const SRC_ORDER=["HEVC","AV1","H264","HDR"], OUT_ORDER=["H264","HEVC","AV1"];
+const SRC_NICE={HEVC:"4K HEVC",AV1:"4K AV1",H264:"4K H264",HDR:"4K HDR"};
+function parseProf(p){
+  const m=/^4K (\\w+) -> 1080p (\\w+)( \\+ subs)?$/.exec(p);
+  return m?{src:m[1],out:m[2],subs:!!m[3]}:null;
+}
+function profOf(s){return "4K "+s.src+" -> 1080p "+s.out+(s.subs?" + subs":"");}
+function pcount(src,out,subs){
+  const f=PROFILES.find(p=>p.src===src&&p.out===out&&p.subs===subs);
+  return f?f.count:0;
+}
+function srcTotal(src){return PROFILES.filter(p=>p.src===src).reduce((t,p)=>t+p.count,0);}
+function renderPills(){
+  const srcEl=document.getElementById("srcs"), outEl=document.getElementById("outs");
+  // sources: shown if populated (canonical HEVC always shown); outputs: for the chosen source
+  const srcs=SRC_ORDER.filter(s=>s==="HEVC"||srcTotal(s)>0);
+  srcEl.innerHTML=srcs.map(s=>{
+    const n=srcTotal(s);
+    return '<button class="prof'+(SEL.src===s?' on':'')+'" data-s="'+s+'">'+SRC_NICE[s]
+      +(n?'<small>'+n+'</small>':'')+'</button>';
+  }).join("");
+  const outs=OUT_ORDER.filter(o=>(SEL.src==="HEVC"&&o==="H264")||pcount(SEL.src,o,false)>0||pcount(SEL.src,o,true)>0);
+  let html=outs.map(o=>{
+    const n=pcount(SEL.src,o,false);
+    return '<button class="prof'+(SEL.out===o&&!SEL.subs?' on':'')+'" data-o="'+o+'">'+(CODEC_NICE[o]||o)
+      +(n?'<small>'+n+'</small>':'')+'</button>';
+  }).join("");
+  const sn=pcount(SEL.src,SEL.out,true);
+  if(sn) html+='<button class="prof subs'+(SEL.subs?' on':'')+'" data-subs="1">+ subtitles<small>'+sn+'</small></button>';
+  outEl.innerHTML=html;
+  srcEl.querySelectorAll("[data-s]").forEach(b=>b.addEventListener("click",()=>{
+    SEL.src=b.dataset.s;
+    // keep the output if it exists under the new source, else first populated (canonical fallback)
+    if(!(pcount(SEL.src,SEL.out,false)>0||(SEL.src==="HEVC"&&SEL.out==="H264")))
+      SEL.out=OUT_ORDER.find(o=>pcount(SEL.src,o,false)>0)||"H264";
+    if(SEL.subs&&!pcount(SEL.src,SEL.out,true)) SEL.subs=false;
+    applySel();
+  }));
+  outEl.querySelectorAll("[data-o]").forEach(b=>b.addEventListener("click",()=>{
+    SEL.out=b.dataset.o;
+    if(SEL.subs&&!pcount(SEL.src,SEL.out,true)) SEL.subs=false;
+    if(!SEL.subs&&b.dataset.o===SEL.out) SEL.subs=false;
+    applySel();
+  }));
+  const sb=outEl.querySelector("[data-subs]");
+  if(sb) sb.addEventListener("click",()=>{SEL.subs=!SEL.subs;applySel();});
+}
+function applySel(){PROFILE=profOf(SEL);SHOWALL=false;renderPills();loadBoard();}
+// ---- search, vendor chips, cross-profile strip ------------------------------------------------
+const VENDS=[["","All"],["intel","Intel"],["amd","AMD"],["nvidia","NVIDIA"]];
+function renderChips(){
+  document.getElementById("vchips").innerHTML=VENDS.map(v=>
+    '<button class="vchip'+(VEND===v[0]?' on':'')+'" data-v="'+v[0]+'">'+v[1]+'</button>').join("");
+  document.querySelectorAll(".vchip").forEach(b=>b.addEventListener("click",()=>{VEND=b.dataset.v;SHOWALL=false;renderRows();}));
+}
+let XT=null;
+function xprofCheck(rows){
+  const el=document.getElementById("xprof");
+  el.style.display="none";
+  if(!Q||rows.length<1) return;
+  const bases=[...new Set(rows.map(r=>r.base_gpu))];
+  if(bases.length!==1) return;
+  const g=bases[0];
+  clearTimeout(XT);
+  XT=setTimeout(async()=>{
+    try{
+      const d=await (await fetch("/api/detail?gpu="+encodeURIComponent(g)+"&profiles=1")).json();
+      const others=(d.profiles||[]).filter(p=>p.profile!==PROFILE&&parseProf(p.profile));
+      if(!others.length) return;
+      el.innerHTML='<b>'+esc(g)+'</b> also on: '+others.map(p=>
+        '<a data-p="'+esc(p.profile)+'">'+profLabel(p.profile)+' ('+p.count+')</a>').join(' · ');
+      el.style.display="block";
+      el.querySelectorAll("a").forEach(a=>a.addEventListener("click",()=>{
+        const ps=parseProf(a.dataset.p); if(!ps) return;
+        SEL=ps; applySel();
+      }));
+    }catch(e){}
+  },350);
+}
+// ---- table: filter → sort → truncate ----------------------------------------------------------
+const SORTS={median_streams:-1,best_streams:-1,median_wps:1,count:-1};   // default direction each
+function setSort(k){
+  SORT = SORT.k===k ? {k,dir:-SORT.dir} : {k,dir:SORTS[k]};
+  renderRows();
+}
+function visibleRows(){
+  let rows=ROWS;
+  if(Q){const q=Q.toLowerCase();rows=rows.filter(r=>String(r.gpu).toLowerCase().indexOf(q)>=0);}
+  if(VEND) rows=rows.filter(r=>String(r.vendor||"").toLowerCase()===VEND);
+  rows=[...rows].sort((a,b)=>{
+    const av=a[SORT.k], bv=b[SORT.k];
+    if(av==null&&bv==null) return 0;
+    if(av==null) return 1;                       // missing values sink regardless of direction
+    if(bv==null) return -1;
+    return (av-bv)*SORT.dir;
+  });
+  return rows;
+}
 function renderRows(){
   const tb=document.getElementById("tb");
-  if(!ROWS.length){tb.innerHTML='<tr><td colspan="6" class="empty">No submissions yet for this test — be the first!</td></tr>';return;}
-  // ranking is IDENTICAL in both view states — the toggle adds depth, never re-sorts
-  tb.innerHTML=ROWS.map((r,i)=>{
+  document.querySelectorAll(".arr").forEach(a=>a.textContent="");
+  const arr=document.getElementById("a-"+SORT.k);
+  if(arr) arr.textContent=SORT.dir<0?"▼":"▲";
+  const rows=visibleRows();
+  const filtered=!!(Q||VEND);
+  xprofCheck(rows);
+  if(!rows.length){
+    tb.innerHTML='<tr><td colspan="6" class="empty">'+(filtered?'No GPUs match — clear the search or chips.':'No submissions yet for this test — be the first!')+'</td></tr>';
+    document.getElementById("showall").style.display="none";
+    return;
+  }
+  const shown=(filtered||SHOWALL)?rows:rows.slice(0,TOPN);
+  // efficiency badge: best (lowest) W/stream among what's on screen
+  let effMin=null;
+  for(const r of shown) if(r.median_wps!=null&&(effMin==null||r.median_wps<effMin)) effMin=r.median_wps;
+  tb.innerHTML=shown.map((r,i)=>{
     const cnt = r.understated ? (r.count+' run'+(r.count>1?'s':'')) : (r.clean_count+' clean run'+(r.clean_count>1?'s':''));
     return '<tr class="gpurow'+(i===0?' top':'')+'" data-gpu="'+esc(r.base_gpu)+'" data-gen="'+esc(r.ram_gen||"")+'" data-cap="'+(r.session_capped?'1':'0')+'"><td class="rank">'+(i+1)+'</td>'
       +'<td class="gpu"><span class="chev">▸</span>'+esc(r.gpu)+'<div class="v">'+esc(r.vendor||"")+'</div></td>'
       +'<td class="num"><span class="big">'+r.median_streams+'</span>'
-      +' <span class="ccount">('+cnt+')</span>'
+      +' <span class="ccount">('+cnt+')'+(r.provisional?' <span class="prov">provisional</span>':'')+'</span>'
       +(r.count>1&&r.min_streams!==r.best_streams?' <span class="range">('+r.min_streams+'–'+r.best_streams+')</span>':'')
-      +(r.provisional?'<span class="prov">provisional</span>':'')
       +(r.understated?'<div class="under">measured under load — may understate</div>':'')
       +(ALLVIEW&&!r.understated&&r.all_count>r.clean_count?'<div class="allline">all runs: median '+r.all_median+' ('+r.all_count+')</div>':'')
       +(r.mostly_capped?'<div class="cap2">engine throughput ≈'+(r.median_projected||"?")+'× realtime — sessions capped by the driver</div>':'')+'</td>'
       +'<td class="num">'+r.best_streams+'</td>'
-      +'<td class="num">'+(r.median_wps!=null?r.median_wps:"—")+'</td>'
+      +'<td class="num effcell">'+(r.median_wps!=null?r.median_wps:"—")
+      +(effMin!=null&&r.median_wps===effMin&&shown.length>1?'<span class="effbadge">⚡ most efficient</span>':'')+'</td>'
       +'<td class="num">'+r.count+'</td></tr>';
   }).join("");
   tb.querySelectorAll("tr.gpurow").forEach(tr=>tr.addEventListener("click",()=>toggle(tr,tr.dataset.gpu,tr.dataset.gen,tr.dataset.cap)));
+  const sa=document.getElementById("showall");
+  if(!filtered&&!SHOWALL&&rows.length>TOPN){
+    sa.style.display="";
+    sa.querySelector("button").textContent="Show all "+rows.length;
+  }else sa.style.display="none";
 }
 function loadBoard(){
   document.getElementById("sub").innerHTML='Simultaneous <b>'+profLabel(PROFILE)
     +' (8M)</b> streams at ≥ 1.0× realtime · median of clean-start community runs · click a row for the breakdown';
-  document.querySelectorAll(".prof").forEach(b=>b.classList.toggle("on", b.dataset.p===PROFILE));
   const tb=document.getElementById("tb");
   tb.innerHTML='<tr><td colspan="6" class="empty">Loading…</td></tr>';
   fetch("/api/top?profile="+encodeURIComponent(PROFILE)).then(r=>r.json()).then(d=>{
     ROWS=d.rows||[]; renderRows();
   });
 }
+document.querySelectorAll("th.sortable").forEach(th=>th.addEventListener("click",()=>setSort(th.dataset.k)));
+document.getElementById("q").addEventListener("input",e=>{Q=e.target.value.trim();SHOWALL=false;renderRows();});
+renderChips();
 fetch("/api/profiles").then(r=>r.json()).then(d=>{
-  const el=document.getElementById("profs");
-  const ps=(d.profiles||[]);
-  // pills only earn their place once there is a CHOICE to make
-  if(ps.length>1){
-    el.innerHTML=ps.map(p=>'<button class="prof" data-p="'+esc(p.profile)+'">'+profLabel(p.profile)
-      +(p.count?'<small>'+p.count+'</small>':'')+'</button>').join("");
-    el.querySelectorAll(".prof").forEach(b=>b.addEventListener("click",()=>{PROFILE=b.dataset.p;loadBoard();}));
+  PROFILES=(d.profiles||[]).map(p=>{
+    const ps=parseProf(p.profile);
+    return ps?{profile:p.profile,count:p.count||0,src:ps.src,out:ps.out,subs:ps.subs}:null;
+  }).filter(Boolean);
+  // the two-row navigation earns its place once there is any CHOICE beyond canonical
+  const choices=new Set(PROFILES.filter(p=>p.count>0).map(p=>p.profile));
+  if(choices.size>1||([...choices][0]&&[...choices][0]!==PROFILE)){
+    document.getElementById("pillrows").style.display="";
+    renderPills();
   }
   loadBoard();
 });
