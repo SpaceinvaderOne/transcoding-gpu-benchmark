@@ -986,6 +986,34 @@ class TestClipStageHash(unittest.TestCase):
         self.assertTrue(benchmark._STAGED_VERIFIED)
         self.assertEqual(benchmark._STAGED_SHA, self.sha)
 
+    def test_corrupt_cache_heals_by_redownload(self):
+        # a bit-flipped CACHED clip keeps its size (passes resolve_clip) but fails the stage
+        # hash — stage must delete it and re-fetch rather than run local-only forever. In this
+        # test CLIPS_DIR == CLIPS_CACHE_DIR is split so the master counts as CACHED.
+        import tempfile
+        cache2 = tempfile.mkdtemp()
+        benchmark.CLIPS_DIR = tempfile.mkdtemp()          # empty: nothing "shipped"
+        benchmark.CLIPS_CACHE_DIR = cache2
+        bad = os.path.join(cache2, "source_4k_hevc.mkv")
+        with open(bad, "wb") as f:
+            f.write(b"z" * len(self.data))                # same size, wrong bytes
+        fetched = {"n": 0}
+        def fake_download(name, dest_dir, progress_cb=None, abort_event=None):
+            fetched["n"] += 1
+            p = os.path.join(dest_dir, name)
+            with open(p, "wb") as f:
+                f.write(self.data)                        # the pinned bitstream
+            return p
+        old_dl = benchmark.download_clip
+        benchmark.download_clip = fake_download
+        try:
+            benchmark.stage_clip("4k", "hevc")
+        finally:
+            benchmark.download_clip = old_dl
+        self.assertEqual(fetched["n"], 1)                 # corrupt cache triggered ONE re-fetch
+        self.assertTrue(benchmark._STAGED_VERIFIED)
+        self.assertEqual(benchmark._STAGED_SHA, self.sha)
+
 
 class TestRunComparable(unittest.TestCase):
     """clip_verified joins the comparable gate: a locally generated (hash-mismatched) clip can

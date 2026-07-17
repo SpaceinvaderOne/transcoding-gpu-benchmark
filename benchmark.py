@@ -1685,18 +1685,33 @@ def stage_clip(source_res, input_codec, custom_path=None):
             _STAGED_SHA, _STAGED_VERIFIED = cur, True
             return SOURCE
     clear_ramdisk()
-    master, verified = ensure_clip(source_res, input_codec, abort_event=_ABORT)
-    if master.startswith(RAMDISK):
-        # one-shot download straight into the ramdisk (no /config): RENAME, never copy —
-        # two 455 MB copies would overflow the 512 MiB tmpfs (download already hash-verified)
-        os.replace(master, SOURCE)
-        _STAGED_SHA = sha256_file(SOURCE) if expected_sha else None
-    else:
-        publish(phase="preparing", message=f"Loading {source_res} {input_codec.upper()} test clip into RAM…")
-        _STAGED_SHA = copy_with_sha256(master, SOURCE)   # hash the staged bytes for free
-    # the staged clip is verified iff its ACTUAL bytes match the manifest (subsumes the download/
-    # generate checks); fall back to ensure_clip's verdict only when there's no manifest hash
-    _STAGED_VERIFIED = (_STAGED_SHA == expected_sha) if expected_sha else verified
+    for attempt in (0, 1):
+        master, verified = ensure_clip(source_res, input_codec, abort_event=_ABORT)
+        if master.startswith(RAMDISK):
+            # one-shot download straight into the ramdisk (no /config): RENAME, never copy —
+            # two 455 MB copies would overflow the 512 MiB tmpfs (download already hash-verified)
+            os.replace(master, SOURCE)
+            _STAGED_SHA = sha256_file(SOURCE) if expected_sha else None
+        else:
+            publish(phase="preparing", message=f"Loading {source_res} {input_codec.upper()} test clip into RAM…")
+            _STAGED_SHA = copy_with_sha256(master, SOURCE)   # hash the staged bytes for free
+        # the staged clip is verified iff its ACTUAL bytes match the manifest (subsumes the
+        # download/generate checks); ensure_clip's verdict applies only with no manifest hash
+        _STAGED_VERIFIED = (_STAGED_SHA == expected_sha) if expected_sha else verified
+        if _STAGED_VERIFIED or expected_sha is None or attempt == 1:
+            break
+        # CACHED clip whose bytes no longer match the manifest (bit-rot keeps the size, so the
+        # cheap size check passed): delete it and re-fetch ONCE — an honest user's runs must not
+        # silently become local-only forever over a corrupt cache file. Shipped/generated
+        # mismatches don't retry (re-fetching can't improve them).
+        cached = os.path.join(CLIPS_CACHE_DIR, name)
+        if master != cached or not os.path.exists(cached):
+            break
+        publish(message=f"Cached {input_codec.upper()} clip failed verification — re-downloading it…")
+        try:
+            os.remove(cached)
+        except Exception:
+            break
     _STAGED = key
     return SOURCE
 

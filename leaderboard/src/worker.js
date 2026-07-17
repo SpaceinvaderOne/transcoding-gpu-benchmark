@@ -646,8 +646,7 @@ function renderPills(){
   }));
   outEl.querySelectorAll("[data-o]").forEach(b=>b.addEventListener("click",()=>{
     SEL.out=b.dataset.o;
-    if(SEL.subs&&!pcount(SEL.src,SEL.out,true)) SEL.subs=false;
-    if(!SEL.subs&&b.dataset.o===SEL.out) SEL.subs=false;
+    SEL.subs=false;                        // a plain output pill selects the non-subs board
     applySel();
   }));
   const sb=outEl.querySelector("[data-subs]");
@@ -659,7 +658,7 @@ const VENDS=[["","All"],["intel","Intel"],["amd","AMD"],["nvidia","NVIDIA"]];
 function renderChips(){
   document.getElementById("vchips").innerHTML=VENDS.map(v=>
     '<button class="vchip'+(VEND===v[0]?' on':'')+'" data-v="'+v[0]+'">'+v[1]+'</button>').join("");
-  document.querySelectorAll(".vchip").forEach(b=>b.addEventListener("click",()=>{VEND=b.dataset.v;SHOWALL=false;renderRows();}));
+  document.querySelectorAll(".vchip").forEach(b=>b.addEventListener("click",()=>{VEND=b.dataset.v;SHOWALL=false;renderChips();renderRows();}));
 }
 let XT=null;
 function xprofCheck(rows){
