@@ -218,6 +218,16 @@
   .clib{color:var(--amber);font-size:13px;background:#23200d;border:1px solid #4a3f10;
     border-radius:9px;padding:10px 13px}
   .codecrow .crlabel{min-width:74px;text-align:right}
+  #clipsrow{margin:10px 0 0;width:min(560px,92%)}
+  .clipsbar{display:flex;align-items:center;gap:12px;color:var(--muted);font-size:14px;margin-top:6px}
+  .clipsbar button{background:#14324e;color:#bfe0ff;border:1px solid #2c5c8a;border-radius:9px;
+    padding:6px 14px;font-size:14px;cursor:pointer}
+  .clipsbar button:disabled{opacity:.45;cursor:default}
+  .dlwrap{display:none;position:relative;height:16px;background:#0e1928;border:1px solid #2c3e55;
+    border-radius:8px;margin-top:8px;overflow:hidden}
+  .dlwrap.show{display:block}
+  .dlbar{height:100%;width:0;background:#2f81d6;transition:width .4s}
+  .dltext{position:absolute;inset:0;text-align:center;font-size:11px;line-height:16px;color:#dce8f5}
   .subslbl{display:inline-flex;align-items:center;gap:8px;cursor:pointer;color:var(--ink);font-size:15px}
   .subslbl input{accent-color:#4da3ff;width:16px;height:16px;cursor:pointer}
   .subslbl .cmuted{color:#5d6b80;font-size:13px}
@@ -358,6 +368,13 @@
       </label>
     </div>
     <div id="advnote"></div>
+    <div id="clipsrow" style="display:none">
+      <div class="customhead">Test clips <span class="cmuted" id="clipsnote"></span></div>
+      <div class="clipsbar"><span id="clipstext"></span>
+        <button id="fetchbtn" onclick="fetchClips()" title="The benchmark decodes pinned, checksummed source clips so every result is comparable. They download once into this container's appdata and are kept forever — container updates never re-download them.">⬇ Download all</button>
+      </div>
+      <div class="dlwrap" id="dlwrap"><div class="dlbar" id="dlbar"></div><span class="dltext" id="dltext"></span></div>
+    </div>
     <div id="customrow">
       <div class="customhead">Or test your own file <span class="cmuted">— local only, not comparable</span></div>
       <div id="customlist"></div>
@@ -568,6 +585,7 @@ function renderScreens(s, vendor){
     renderInput(s);
     renderCodec(s);
     renderSubs(s);
+    renderClips(s);
     renderCustom(s);
     renderNote(s);
     const gpus = s.gpus || [];
@@ -606,7 +624,8 @@ function renderScreens(s, vendor){
     const srcRes = RES_LABEL[r.source_res] || "4K", tgtRes = RES_LABEL[r.target_res] || "1080p";
     const srcPart = r.custom_source ? (srcL+" (your file)") : (srcRes+" "+srcL);
     const prof = srcPart + " → " + tgtRes + " " + outL
-      + (inC==="hdr" ? " (tone-mapped)" : "") + (r.subs_burn ? " + subs burned in" : "");
+      + (inC==="hdr" ? " (tone-mapped)" : "") + (r.subs_burn ? " + subs burned in" : "")
+      + (r.clip_verified===false ? " · locally generated clip — local-only" : "");
     v.classList.add("show");
     const batch = !!(s.batch && (s.batch_results||[]).length);
     document.getElementById("batchbody").classList.toggle("show", batch);
@@ -864,6 +883,31 @@ function renderCodec(s){
   fillSel("codec", g.codecs||["h264"], s.selected_codec, c=>CODEC_LABEL[c]||c);
   const sr = s.selected_source_res||"4k";
   fillSel("tres", (s.target_res_by_source||{})[sr]||["1080p"], s.selected_target_res||"1080p", r=>RES_LABEL[r]||r);
+}
+function fetchClips(){ post("/fetchclips"); }
+function renderClips(s){
+  // canonical-clip cache panel — moot (hidden) when the image ships clips baked in
+  const row = document.getElementById("clipsrow");
+  const clips = s.clips || [];
+  if(s.clips_shipped || !clips.length){ row.style.display="none"; return; }
+  row.style.display = "";
+  const ready = clips.filter(c=>c.status!=="missing");
+  const missing = clips.filter(c=>c.status==="missing");
+  const missMB = missing.reduce((a,c)=>a+(c.size_mb||0),0);
+  document.getElementById("clipstext").textContent = missing.length
+    ? ready.length+" of "+clips.length+" clips ready · "+(missMB>=1000?(missMB/1000).toFixed(1)+" GB":missMB+" MB")+" to download"
+    : "all "+clips.length+" clips downloaded ✓";
+  document.getElementById("clipsnote").textContent = missing.length
+    ? "— downloaded once, kept in appdata forever" : "";
+  const dl = s.clip_dl;
+  document.getElementById("fetchbtn").style.display = missing.length ? "" : "none";
+  document.getElementById("fetchbtn").disabled = !!dl;
+  const wrap = document.getElementById("dlwrap");
+  wrap.classList.toggle("show", !!dl);
+  if(dl){
+    document.getElementById("dlbar").style.width = dl.pct+"%";
+    document.getElementById("dltext").textContent = dl.name+" — "+dl.mb+" / "+dl.total_mb+" MB ("+dl.pct.toFixed(0)+"%)";
+  }
 }
 function selectSubs(on){ post("/subs?b="+(on?1:0)); }
 function renderSubs(s){

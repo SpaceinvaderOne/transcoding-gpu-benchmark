@@ -26,8 +26,10 @@ import signal
 import shlex
 import threading
 import subprocess
+import hashlib
 import urllib.error
 import urllib.parse
+import urllib.request
 import uuid
 import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -40,7 +42,19 @@ FFMPEG          = _env("FFMPEG_BIN", "/usr/lib/jellyfin-ffmpeg/ffmpeg")
 FFPROBE         = _env("FFPROBE_BIN", FFMPEG.rsplit("ffmpeg", 1)[0] + "ffprobe")
 RAMDISK         = _env("RAMDISK", "/ramdisk")
 SOURCE          = os.path.join(RAMDISK, "source.mkv")
-CLIPS_DIR       = _env("CLIPS_DIR", "/app/clips")   # shipped canonical masters (source_<codec>.mkv)
+CLIPS_DIR       = _env("CLIPS_DIR", "/app/clips")   # transition-era images ship clips here
+PROBES_DIR      = _env("PROBES_DIR", "/app/probes") # tiny 1s clips for capability probing only
+# Canonical clips are PINNED GitHub Release assets (immutable tag clips-v1) — downloaded once,
+# hash-verified against this baked-in manifest, cached in appdata. URL is HARDCODED by design:
+# changing clips means shipping a new image with a new manifest, never a config edit.
+CLIPS_BASE_URL  = "https://github.com/SpaceinvaderOne/transcoding-gpu-benchmark/releases/download/clips-v1/"
+CLIP_MANIFEST   = {   # name -> (sha256, exact bytes) — extracted from the validated image
+    "source_4k_hevc.mkv":  ("13ff9e46afac887744c508fac0bf343281ebf1168e8ff9017ab7532be9f5a27a", 455504333),
+    "source_4k_av1.mkv":   ("8e2da2352791d4f3c066c29ebfe92b0bd657ec898233be635d43e099aee728f6", 409161502),
+    "source_4k_h264.mkv":  ("9c44eef58045ceaf1e768a9f6736eb3119e67aae7f3fadde25de19ae58d920e1", 442156462),
+    "source_4k_hdr.mkv":   ("41a36e640fa40609bcbab0ce0f42a1fba58c1ef3808606f816da6ec57cbd4bce", 455506587),
+    "source_1080p_h264.mkv": ("6394d675568c48fc502adacb98bf59abebe8bfd4ebdb064d6751e9ead636f237", 84393066),
+}
 INPUT_CODECS    = ("h264", "hevc", "av1")           # selectable source codecs (must hw-decode)
 BURNIN_ASS      = _env("BURNIN_ASS", "/app/burnin.ass")  # shipped deterministic burn-in subtitles
 INPUT_DIR       = _env("INPUT_DIR", "/input")       # optional BYO-clip drop folder (read-only)
@@ -61,6 +75,7 @@ CONFIG_DIR      = _env("CONFIG_DIR", "/config")   # Unraid appdata mount (CPU ba
 POWERCAP_DIR    = _env("POWERCAP_DIR", "/powercap")  # optional RO mount of host
                                                      # /sys/devices/virtual/powercap (RAPL CPU power)
 BASELINE_FILE   = os.path.join(CONFIG_DIR, "cpu_baseline.json")
+CLIPS_CACHE_DIR = os.path.join(CONFIG_DIR, "clips")   # one-time clip cache (survives updates)
 HISTORY_FILE    = os.path.join(CONFIG_DIR, "history.json")   # per-run history (newest last)
 HISTORY_CAP     = int(_env("HISTORY_CAP", "200"))
 INSTALL_ID_FILE = os.path.join(CONFIG_DIR, "install_id")   # random per-install uuid (submission dedup)
@@ -363,6 +378,9 @@ STATE = {
     "selected_target_res": "1080p",  # output resolution (4k|1080p|720p, <= source) — default 1080p
     "selected_mode": "streaming",  # streaming (how many at once) | convert (how fast)
     "selected_subs": False,       # burn the shipped subtitles in (streaming realism toggle)
+    "clips": [],                  # canonical-clip cache states [{name,status,size_mb}]
+    "clips_shipped": True,        # image bakes the clips in (transition) ⇒ hide the clips panel
+    "clip_dl": None,              # live download progress {name,pct,mb,total_mb}
     "custom_files": [],           # BYO-clip drop folder contents [{name,path,codec,res}]
     "custom_library": False,      # /input looks like a media library (too many files)
     "selected_custom": None,      # chosen custom file NAME (None ⇒ use the shipped clip)
@@ -898,6 +916,227 @@ def clip_master(source_res, input_codec):
     return os.path.join(CLIPS_DIR, f"source_{source_res}_{input_codec}.mkv")
 
 
+def verify_file_hash(path, sha256_hex):
+    """SHA-256 the whole file and compare (constant memory; used at download time only —
+    cached clips are trusted by exact size afterwards, spinning appdata arrays shouldn't
+    re-read 1.85 GB every boot)."""
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest() == sha256_hex
+    except Exception:
+        return False
+
+
+def cached_ok(path, size):
+    """A cached clip is valid iff it exists at EXACTLY the manifest size (hash was verified
+    when it was downloaded; a size mismatch means a torn/corrupt file → re-download)."""
+    try:
+        return os.path.getsize(path) == size
+    except Exception:
+        return False
+
+
+def resolve_clip(name):
+    """Where is this canonical clip? → (path, status): shipped (baked into a transition-era
+    image), cached (downloaded + verified earlier), or (None, 'missing') = needs download."""
+    shipped = os.path.join(CLIPS_DIR, name)
+    if os.path.exists(shipped):
+        return shipped, "shipped"
+    cache = os.path.join(CLIPS_CACHE_DIR, name)
+    if name in CLIP_MANIFEST and cached_ok(cache, CLIP_MANIFEST[name][1]):
+        return cache, "cached"
+    return None, "missing"
+
+
+def clips_status():
+    """Per-clip cache state for the UI. shipped=True ⇒ the whole panel is moot (image has
+    everything baked in — transition images)."""
+    out = []
+    for name, (_sha, size) in CLIP_MANIFEST.items():
+        path, status = resolve_clip(name)
+        out.append({"name": name, "status": status, "size_mb": round(size / 1e6)})
+    return out
+
+
+_CLIP_DL_LOCK = threading.Lock()   # serialize downloads (fetch-all vs an on-demand run)
+
+
+def download_clip(name, dest_dir, progress_cb=None, abort_event=None):
+    """Stream one pinned release asset → dest_dir/name. SHA-256 is computed WHILE streaming;
+    atomic .part → rename only after the hash matches the manifest. Returns the final path.
+    Raises RuntimeError on network failure / hash mismatch / abort (the .part never survives).
+    Serialized: a fetch-all and an on-demand download of the same file can't collide, and the
+    second caller finds the finished file instead of re-downloading."""
+    sha, size = CLIP_MANIFEST[name]
+    os.makedirs(dest_dir, exist_ok=True)
+    part = os.path.join(dest_dir, f".{name}.part")
+    final = os.path.join(dest_dir, name)
+    with _CLIP_DL_LOCK:
+        if cached_ok(final, size):
+            return final
+        return _download_clip_locked(name, sha, size, part, final, progress_cb, abort_event)
+
+
+def _download_clip_locked(name, sha, size, part, final, progress_cb, abort_event):
+    req = urllib.request.Request(CLIPS_BASE_URL + name,
+                                 headers={"User-Agent": f"gpu-benchmark/{TOOL_VERSION}"})
+    h = hashlib.sha256()
+    done = 0
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r, open(part, "wb") as f:
+            while True:
+                if abort_event is not None and abort_event.is_set():
+                    raise RuntimeError("download cancelled")
+                chunk = r.read(1024 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+                h.update(chunk)
+                done += len(chunk)
+                if progress_cb:
+                    progress_cb(done, size)
+        if done != size or h.hexdigest() != sha:
+            raise RuntimeError("downloaded clip failed verification (size/hash mismatch)")
+        os.replace(part, final)   # atomic: a valid file appears all-at-once or never
+        return final
+    except Exception:
+        try:
+            os.remove(part)
+        except Exception:
+            pass
+        raise
+
+
+def _publish_clip_dl(name, done, total):
+    publish(clip_dl={"name": name, "pct": round(done * 100.0 / total, 1),
+                     "mb": round(done / 1e6), "total_mb": round(total / 1e6)},
+            message=f"Downloading {name} — one-time, {round(total / 1e6)} MB… "
+                    f"{done * 100.0 / total:.0f}%")
+
+
+_FETCHING = threading.Event()   # a download-all is in flight (one at a time)
+
+
+def fetch_all_clips():
+    """Background download of every missing canonical clip (the '⬇ Download all' button).
+    Sequential — the appdata share is usually one spinning array. Publishes per-clip progress;
+    a failure reports and keeps going (partial success still saves the user time later)."""
+    try:
+        failed = []
+        for name in CLIP_MANIFEST:
+            if resolve_clip(name)[0] is not None:
+                continue
+            try:
+                os.makedirs(CLIPS_CACHE_DIR, exist_ok=True)
+                download_clip(name, CLIPS_CACHE_DIR,
+                              progress_cb=lambda d, t, n=name: _publish_clip_dl(n, d, t))
+                publish(clips=clips_status())
+            except Exception as e:
+                failed.append(name)
+                publish(message=f"Download of {name} failed: {e}")
+        publish(clip_dl=None, clips=clips_status(),
+                message=("All test clips downloaded — they're kept in appdata, this was a "
+                         "one-time download." if not failed else
+                         f"Done with errors — {len(failed)} clip(s) failed; try again later."))
+    finally:
+        _FETCHING.clear()
+
+
+def start_fetch_clips():
+    """POST /fetchclips — idle only, one at a time; no-op when nothing is missing."""
+    with RUN_LOCK:
+        with STATE_LOCK:
+            cur = STATE.get("ui")
+        if cur != "idle" or _FETCHING.is_set():
+            return False
+        if all(resolve_clip(n)[0] is not None for n in CLIP_MANIFEST):
+            return False
+        _FETCHING.set()
+        threading.Thread(target=fetch_all_clips, daemon=True).start()
+        return True
+
+
+def generate_canonical_clip(name, dest):
+    """Offline fallback: mint the clip locally with the EXACT canonical recipe (same params the
+    clips-v1 assets were minted with). The bitstream is encoder-threading-dependent, so the
+    result usually WON'T hash-match the manifest on other machines — the caller hash-checks and
+    marks the run non-comparable on mismatch. Slow (minutes): CPU x265/svt encode."""
+    recipes = {
+        "source_4k_hevc.mkv": ["-f", "lavfi", "-i", "mandelbrot=size=3840x2160:rate=24", "-t", "60",
+            "-pix_fmt", "yuv420p10le", "-c:v", "libx265", "-preset", "medium", "-b:v", "50M",
+            "-x265-params", "keyint=240:min-keyint=240:log-level=none"],
+        "source_4k_av1.mkv": ["-f", "lavfi", "-i", "mandelbrot=size=3840x2160:rate=24", "-t", "60",
+            "-pix_fmt", "yuv420p10le", "-c:v", "libsvtav1", "-preset", "6", "-b:v", "50M",
+            "-g", "240", "-svtav1-params", "tune=0:film-grain=0"],
+        "source_4k_h264.mkv": ["-f", "lavfi", "-i", "mandelbrot=size=3840x2160:rate=24", "-t", "60",
+            "-pix_fmt", "yuv420p", "-c:v", "libx264", "-preset", "medium", "-b:v", "50M",
+            "-x264-params", "keyint=240:min-keyint=240"],
+        "source_4k_hdr.mkv": ["-f", "lavfi", "-i", "mandelbrot=size=3840x2160:rate=24", "-t", "60",
+            "-pix_fmt", "yuv420p10le", "-c:v", "libx265", "-preset", "medium", "-b:v", "50M",
+            "-x265-params", "keyint=240:min-keyint=240:log-level=none:hdr10=1:repeat-headers=1:"
+            "colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:"
+            "master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1):"
+            "max-cll=1000,400"],
+        "source_1080p_h264.mkv": ["-f", "lavfi", "-i", "mandelbrot=size=1920x1080:rate=24", "-t", "60",
+            "-pix_fmt", "yuv420p", "-c:v", "libx264", "-preset", "medium", "-b:v", "10M",
+            "-x264-params", "keyint=240:min-keyint=240"],
+    }
+    cmd = [FFMPEG, "-y", "-hide_banner", "-loglevel", "error"] + recipes[name] + [dest]
+    r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=3600)
+    if r.returncode != 0 or not os.path.exists(dest):
+        raise RuntimeError("local clip generation failed")
+    return dest
+
+
+def ensure_clip(source_res, input_codec, abort_event=None):
+    """Make the canonical clip for (res, codec) available; returns (path, verified).
+    shipped/cached ⇒ verified. Missing ⇒ download (to appdata cache, or straight to the
+    ramdisk when /config isn't writable) with live progress; on network failure fall back to
+    local generation and hash-check it (match ⇒ still verified/comparable)."""
+    name = os.path.basename(clip_master(source_res, input_codec))
+    path, status = resolve_clip(name)
+    if path:
+        return path, True
+    sha, size = CLIP_MANIFEST[name]
+    # pick a destination: persistent cache if /config is writable, else the ramdisk (one-shot)
+    dest_dir, oneshot = CLIPS_CACHE_DIR, False
+    try:
+        os.makedirs(CLIPS_CACHE_DIR, exist_ok=True)
+    except Exception:
+        dest_dir, oneshot = RAMDISK, True
+    try:
+        p = download_clip(name, dest_dir, progress_cb=lambda d, t: _publish_clip_dl(name, d, t),
+                          abort_event=abort_event)
+        publish(clip_dl=None, clips=clips_status())
+        if oneshot:
+            publish(message="Clip downloaded to RAM only — map /config (appdata) to keep it.")
+        return p, True
+    except Exception as e:
+        if abort_event is not None and abort_event.is_set():
+            raise
+        publish(clip_dl=None,
+                message=f"Download failed ({e}) — generating the clip locally instead "
+                        f"(slower; result will be local-only unless it matches the pinned hash).")
+        dest = os.path.join(dest_dir, name)
+        generate_canonical_clip(name, dest)
+        ok = verify_file_hash(dest, sha)
+        publish(clips=clips_status())
+        return dest, ok
+
+
+def is_run_comparable(mode, source_res, target_res, custom_source, is_cpu,
+                      threshold, hold, settle, clip_verified):
+    """The single leaderboard-eligibility gate: canonical streaming 4K→1080p on a real GPU,
+    strict 1.0× rule, standard hold/settle, and a VERIFIED canonical clip (shipped or
+    hash-matched — a locally generated variant bitstream is never comparable)."""
+    return (mode == "streaming" and is_comparable(source_res, target_res)
+            and not custom_source and not is_cpu and threshold == 1.0
+            and hold >= 25 and settle >= 5 and clip_verified)
+
+
 VIDEO_EXTS = (".mkv", ".mp4", ".mov", ".ts", ".m4v", ".avi", ".webm", ".m2ts", ".mpg", ".wmv")
 
 
@@ -927,13 +1166,24 @@ def sample_window(duration, want=60.0):
     return (round(duration / 2.0 - want / 2.0, 3), want)
 
 
+def probe_clip(codec):
+    """The clip capability probes decode: a tiny 1 s probe file (shipped precisely for this —
+    full clips are downloaded on demand and may not exist yet at detect time), falling back to
+    the full clip on transition-era images that still bake clips in."""
+    p = os.path.join(PROBES_DIR, f"probe_4k_{codec}.mkv")
+    if os.path.exists(p):
+        return p
+    full = clip_master("4k", codec)
+    return full if os.path.exists(full) else None
+
+
 def decode_supported(gpu, codec):
-    """Can this GPU HARDWARE-decode this source codec? Decodes 1 frame of the shipped clip on
+    """Can this GPU HARDWARE-decode this source codec? Decodes 1 frame of the probe clip on
     the GPU; if the hw path is missing ffmpeg would fall to CPU and this returns False — which
     is exactly what keeps an AV1-decode-incapable card from silently benchmarking the CPU."""
-    master = clip_master("4k", codec)   # decode capability is resolution-independent
-    if not os.path.exists(master):
-        return codec == "hevc"          # no shipped clip (dev build): assume only HEVC
+    master = probe_clip(codec)          # decode capability is resolution-independent
+    if not master:
+        return codec == "hevc"          # no probe clip at all (dev build): assume only HEVC
     if gpu["api"] == "vaapi":
         cmd = [FFMPEG, "-hide_banner", "-loglevel", "error",
                "-hwaccel", "vaapi", "-hwaccel_device", gpu["device"],
@@ -954,12 +1204,12 @@ def decode_supported(gpu, codec):
 
 def tonemap_supported(gpu):
     """Can this device HDR10→SDR tone-map in hardware (CPU: via the SIMD tonemapx filter)?
-    1-frame decode + tone-map + encode of the shipped HDR clip — the same never-silently-
+    1-frame decode + tone-map + encode of the HDR probe clip — the same never-silently-
     fall-back philosophy as decode_supported. tonemap_vaapi is Intel-iHD-only in practice,
     so AMD/Mesa is expected to fail here and simply not be offered the HDR source."""
-    master = clip_master("4k", "hdr")
-    if not os.path.exists(master):
-        return False                    # no shipped HDR clip (dev build)
+    master = probe_clip("hdr")
+    if not master:
+        return False                    # no HDR probe clip at all (dev build)
     if gpu.get("vendor") == "cpu":
         cmd = [FFMPEG, "-hide_banner", "-loglevel", "error", "-i", master,
                "-frames:v", "1", "-an",
@@ -1382,22 +1632,31 @@ def sample_custom(path):
     return SOURCE
 
 
+_STAGED_VERIFIED = True   # was the last staged canonical clip the pinned bitstream?
+
+
 def stage_clip(source_res, input_codec, custom_path=None):
     """Get the source into the ramdisk and return its path. Custom file → a middle-60 s sample;
-    otherwise the shipped canonical clip for (source_res, input_codec). Clear-before-stage keeps
-    exactly ONE clip in RAM so a 512 MiB ramdisk always fits."""
-    global _STAGED
+    otherwise the canonical clip (shipped in transition images / cached in appdata / downloaded
+    on demand with live progress / generated offline as a last resort — see ensure_clip).
+    Clear-before-stage keeps exactly ONE clip in RAM so a 512 MiB ramdisk always fits."""
+    global _STAGED, _STAGED_VERIFIED
     if custom_path:
         _STAGED = None
         return sample_custom(custom_path)
-    master = clip_master(source_res, input_codec)
     key = (source_res, input_codec)
-    if not os.path.exists(master):
-        raise RuntimeError(f"shipped {source_res} {input_codec.upper()} test clip missing at {master}")
     os.makedirs(RAMDISK, exist_ok=True)
     if _STAGED == key and os.path.exists(SOURCE):
         return SOURCE                       # already in RAM
     clear_ramdisk()
+    master, verified = ensure_clip(source_res, input_codec, abort_event=_ABORT)
+    _STAGED_VERIFIED = verified
+    if master.startswith(RAMDISK):
+        # one-shot download straight into the ramdisk (no /config): RENAME, never copy —
+        # two 455 MB copies would overflow the 512 MiB tmpfs
+        os.replace(master, SOURCE)
+        _STAGED = key
+        return SOURCE
     publish(phase="preparing", message=f"Loading {source_res} {input_codec.upper()} test clip into RAM…")
     shutil.copyfile(master, SOURCE)
     _STAGED = key
@@ -1561,7 +1820,8 @@ def run_level(gpu, src, codec, n, last_passing, target_res="1080p", ten_bit=Fals
 def _build_result(gpu, codec, confirmed_max, single, peak_combined, per_level,
                   capped, projected, pwr, input_codec="hevc", custom_source=False,
                   source_res="4k", target_res="1080p", ten_bit=False,
-                  mode="streaming", rec_workers=None, preset="veryfast", subs=False):
+                  mode="streaming", rec_workers=None, preset="veryfast", subs=False,
+                  clip_verified=True):
     """Assemble the structured result payload + efficiency.
     `pwr` = {idle, idle_pkg, one, one_pkg, peak, peak_pkg} (board + package watts).
     Returns (result, spw, power_estimated)."""
@@ -1605,10 +1865,9 @@ def _build_result(gpu, codec, confirmed_max, single, peak_combined, per_level,
     profile = profile_label(source_res, input_codec, target_res, codec,
                             custom_source, subs, ten_bit)
     # only the canonical 4K->1080p STREAMING run on a real GPU (non-custom) at the STRICT
-    # 1.0x threshold is leaderboard-comparable (a lowered PASS_THRESHOLD inflates counts)
-    comparable = (mode == "streaming" and is_comparable(source_res, target_res)
-                  and not custom_source and not is_cpu and PASS_THRESHOLD == 1.0
-                  and HOLD_SECONDS >= 25 and SETTLE_SECONDS >= 5)
+    # 1.0x threshold, decoding the VERIFIED pinned bitstream, is leaderboard-comparable
+    comparable = is_run_comparable(mode, source_res, target_res, custom_source, is_cpu,
+                                   PASS_THRESHOLD, HOLD_SECONDS, SETTLE_SECONDS, clip_verified)
     result = {
         "tool_version": TOOL_VERSION, "mode": mode, "rec_workers": rec_workers,
         "is_cpu": is_cpu, "cpu_preset": (preset if is_cpu else None),
@@ -1620,7 +1879,7 @@ def _build_result(gpu, codec, confirmed_max, single, peak_combined, per_level,
         "vs_cpu": None, "cpu_baseline_missing": False,
         "profile": profile, "codec": codec, "input_codec": input_codec,
         "source_res": source_res, "target_res": target_res, "ten_bit": ten_bit,
-        "subs_burn": subs,
+        "subs_burn": subs, "clip_verified": clip_verified,
         "comparable": comparable,
         "bitrate": OUTPUT_BITRATE_BY_RES.get(target_res, OUTPUT_BITRATE),
         "threshold": PASS_THRESHOLD,
@@ -1872,7 +2131,8 @@ def benchmark(gpu, codec="h264", input_codec="hevc", custom_path=None,
             gpu, codec, confirmed_max, single, peak_combined, per_level,
             capped, projected, pwr, input_codec, custom_source=bool(custom_path),
             source_res=source_res, target_res=target_res, ten_bit=ten_bit,
-            mode=mode, rec_workers=rec_workers, preset=preset, subs=subs)
+            mode=mode, rec_workers=rec_workers, preset=preset, subs=subs,
+            clip_verified=(_STAGED_VERIFIED if not custom_path else True))
         result.update(vram_extra)
 
         # CPU baseline persistence & the GPU "vs CPU" efficiency comparison (skip for custom clips —
@@ -1952,8 +2212,9 @@ _ABORT = threading.Event()     # user clicked "Cancel run" mid-run (prep or ramp
 
 
 def source_ready():
-    # clips are shipped in the image → Start is always near-instant (hot-loaded into RAM)
-    return os.path.exists(SOURCE) or os.path.exists(clip_master("4k", "hevc"))
+    # Start is near-instant when the default clip is staged, shipped, or cached (a missing one
+    # triggers a one-time download with progress instead)
+    return os.path.exists(SOURCE) or resolve_clip("source_4k_hevc.mkv")[0] is not None
 
 
 def _available(gpus):
@@ -2807,6 +3068,8 @@ class Handler(BaseHTTPRequestHandler):
             ok = select_custom(_query_str(self.path, "f") or "")
         elif self.path.startswith("/subs"):        # ("/submit" doesn't match this prefix)
             ok = select_subs(_query_str(self.path, "b") == "1")
+        elif self.path.startswith("/fetchclips"):
+            ok = start_fetch_clips()
         elif self.path.startswith("/startall"):   # must precede the "/start" prefix match
             ok = start_all()
         elif self.path.startswith("/start"):
@@ -2838,7 +3101,9 @@ def main():
                                   "and/or --runtime=nvidia (NVIDIA).")
     # Boot to Ready/idle — user picks a GPU and triggers the run; nothing auto-starts.
     scan = list_custom_files()       # enumerate any BYO clips in the /input drop folder
+    clips = clips_status()
     publish(ui="idle", phase="idle", message=msg, source_ready=source_ready(),
+            clips=clips, clips_shipped=all(c["status"] == "shipped" for c in clips),
             gpus=public_gpus(_DETECTED), submit_url_set=bool(SUBMIT_URL),
             # public leaderboard page = the submit endpoint's origin (for the View button)
             board_url=(SUBMIT_URL.split("/api/")[0] if SUBMIT_URL else None),

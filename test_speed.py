@@ -2,6 +2,7 @@
 """Unit tests for the correctness-critical pure logic: progress parsing and the
 instantaneous-speed calculation (the thing that must NOT use ffmpeg's cumulative
 speed= field). Run: python3 test_speed.py"""
+import os
 import unittest
 import benchmark
 from benchmark import (parse_progress_kv, compute_inst_speed, is_session_cap_error,
@@ -843,6 +844,108 @@ class TestProfileLabel(unittest.TestCase):
     def test_custom_and_ten_bit(self):
         self.assertEqual(benchmark.profile_label("4k", "hevc", "4k", "hevc", True, False, True),
                          "HEVC (your file) -> 4K HEVC 10-bit")
+
+
+class TestClipManifest(unittest.TestCase):
+    """Clips ship as pinned GitHub Release assets (clips-v1); the manifest (name → sha256+size)
+    is baked into the image and every download is verified against it before use."""
+    def test_manifest_covers_all_shipped_pairs(self):
+        for res, codecs in benchmark.SOURCE_CODECS_BY_RES.items():
+            for c in codecs:
+                name = os.path.basename(benchmark.clip_master(res, c))
+                self.assertIn(name, benchmark.CLIP_MANIFEST, f"missing manifest for {res}/{c}")
+
+    def test_manifest_entries_shape(self):
+        for name, (sha, size) in benchmark.CLIP_MANIFEST.items():
+            self.assertEqual(len(sha), 64)
+            self.assertTrue(int(sha, 16) >= 0)     # valid hex
+            self.assertGreater(size, 1024 * 1024)  # every clip is > 1 MiB
+            self.assertTrue(name.startswith("source_") and name.endswith(".mkv"))
+
+    def test_url_is_pinned_release(self):
+        self.assertIn("/releases/download/clips-v1/", benchmark.CLIPS_BASE_URL)
+        self.assertTrue(benchmark.CLIPS_BASE_URL.startswith("https://"))
+
+
+class TestClipVerify(unittest.TestCase):
+    def test_verify_file_hash(self):
+        import hashlib, tempfile
+        with tempfile.NamedTemporaryFile(delete=False) as f:
+            f.write(b"hello clips")
+            p = f.name
+        good = hashlib.sha256(b"hello clips").hexdigest()
+        self.assertTrue(benchmark.verify_file_hash(p, good))
+        self.assertFalse(benchmark.verify_file_hash(p, "0" * 64))
+        os.unlink(p)
+        self.assertFalse(benchmark.verify_file_hash(p, good))   # missing file → False
+
+    def test_cached_ok_checks_exact_size(self):
+        import tempfile
+        with tempfile.NamedTemporaryFile(delete=False) as f:
+            f.write(b"x" * 100)
+            p = f.name
+        self.assertTrue(benchmark.cached_ok(p, 100))
+        self.assertFalse(benchmark.cached_ok(p, 101))           # size mismatch = corrupt
+        os.unlink(p)
+        self.assertFalse(benchmark.cached_ok(p, 100))
+
+
+class TestClipResolve(unittest.TestCase):
+    """Resolution order: image /app/clips (transition-era images) → /config/clips cache →
+    needs download. Trust cache by existence + exact manifest size."""
+    def setUp(self):
+        import tempfile
+        self.img = tempfile.mkdtemp()
+        self.cache = tempfile.mkdtemp()
+        self._old = (benchmark.CLIPS_DIR, benchmark.CLIPS_CACHE_DIR)
+        benchmark.CLIPS_DIR, benchmark.CLIPS_CACHE_DIR = self.img, self.cache
+
+    def tearDown(self):
+        benchmark.CLIPS_DIR, benchmark.CLIPS_CACHE_DIR = self._old
+
+    def test_image_copy_wins(self):
+        name = "source_4k_hevc.mkv"
+        with open(os.path.join(self.img, name), "wb") as f:
+            f.write(b"img")
+        p, status = benchmark.resolve_clip(name)
+        self.assertEqual(p, os.path.join(self.img, name))
+        self.assertEqual(status, "shipped")
+
+    def test_cache_used_when_size_matches(self):
+        name = "source_4k_hevc.mkv"
+        size = benchmark.CLIP_MANIFEST[name][1]
+        with open(os.path.join(self.cache, name), "wb") as f:
+            f.seek(size - 1)
+            f.write(b"\0")
+        p, status = benchmark.resolve_clip(name)
+        self.assertEqual(p, os.path.join(self.cache, name))
+        self.assertEqual(status, "cached")
+
+    def test_wrong_size_cache_is_ignored(self):
+        name = "source_4k_hevc.mkv"
+        with open(os.path.join(self.cache, name), "wb") as f:
+            f.write(b"truncated")
+        p, status = benchmark.resolve_clip(name)
+        self.assertIsNone(p)
+        self.assertEqual(status, "missing")
+
+
+class TestRunComparable(unittest.TestCase):
+    """clip_verified joins the comparable gate: a locally generated (hash-mismatched) clip can
+    never produce a leaderboard-eligible run."""
+    ARGS = dict(mode="streaming", source_res="4k", target_res="1080p", custom_source=False,
+                is_cpu=False, threshold=1.0, hold=25, settle=5, clip_verified=True)
+
+    def test_canonical_comparable(self):
+        self.assertTrue(benchmark.is_run_comparable(**self.ARGS))
+
+    def test_unverified_clip_blocks(self):
+        self.assertFalse(benchmark.is_run_comparable(**{**self.ARGS, "clip_verified": False}))
+
+    def test_existing_gates_still_hold(self):
+        for k, v in [("mode", "convert"), ("custom_source", True), ("is_cpu", True),
+                     ("threshold", 0.9), ("hold", 12), ("settle", 2), ("target_res", "720p")]:
+            self.assertFalse(benchmark.is_run_comparable(**{**self.ARGS, k: v}), k)
 
 
 if __name__ == "__main__":

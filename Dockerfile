@@ -19,44 +19,31 @@ RUN apt-get update \
 #   pciutils        - lspci, for friendly GPU model names in the picker
 #   dmidecode       - system RAM speed readout (Intel iGPU context)
 
-# Mint the canonical source clips ONCE at build (CPU encoders — no GPU needed) and ship them in
-# the image, so a run NEVER waits for generation: the selected clip is hot-copied into the RAM
-# disk at start (~1 s) and read from there. Both clips come from the identical mandelbrot master,
-# so the only difference between the HEVC and AV1 boards is the codec/decoder under test.
-# This layer is placed before the code COPY so editing benchmark.py doesn't re-mint the clips.
-# NOTE: for a public leaderboard these should be minted ONCE and pinned as fixed artifacts so the
-# bitstream is byte-stable across base-image updates; generating at build risks baseline drift.
-# 4K masters at 50 Mbit (heavy 4K load): HEVC + AV1 are 10-bit, H.264 is 8-bit (hw H.264 decode
-# is 8-bit only). Plus a 1080p H.264 master at 10 Mbit — a realistic "1080p movie on a server"
-# for the modernise-my-old-library scenario (~75 MB). Clip naming: source_<res>_<codec>.mkv.
-RUN mkdir -p /app/clips \
+# The CANONICAL clips are NOT in the image any more: they are pinned, immutable GitHub Release
+# assets (clips-v1), downloaded once on demand, hash-verified against the manifest baked into
+# benchmark.py, and cached in /config/clips (appdata). This keeps the image ~1.85 GB smaller,
+# makes container updates cheap, and guarantees every submission decodes byte-identical data.
+# What IS minted here: four TINY 1-second probe clips used only by the boot-time capability
+# probes (decode_supported / tonemap_supported) — probing must work offline, before any
+# download. Low bitrate, ~1-4 MB each; the hdr probe keeps the BT.2020/PQ + HDR10 metadata.
+RUN mkdir -p /app/probes \
     && /usr/lib/jellyfin-ffmpeg/ffmpeg -y -hide_banner -loglevel error \
-         -f lavfi -i mandelbrot=size=3840x2160:rate=24 -t 60 -pix_fmt yuv420p10le \
-         -c:v libsvtav1 -preset 6 -b:v 50M -g 240 -svtav1-params "tune=0:film-grain=0" \
-         /app/clips/source_4k_av1.mkv \
+         -f lavfi -i mandelbrot=size=3840x2160:rate=24 -t 1 -pix_fmt yuv420p10le \
+         -c:v libx265 -preset ultrafast -b:v 8M -x265-params "log-level=none" \
+         /app/probes/probe_4k_hevc.mkv \
     && /usr/lib/jellyfin-ffmpeg/ffmpeg -y -hide_banner -loglevel error \
-         -f lavfi -i mandelbrot=size=3840x2160:rate=24 -t 60 -pix_fmt yuv420p10le \
-         -c:v libx265 -preset medium -b:v 50M \
-         -x265-params "keyint=240:min-keyint=240:log-level=none" \
-         /app/clips/source_4k_hevc.mkv \
+         -f lavfi -i mandelbrot=size=3840x2160:rate=24 -t 1 -pix_fmt yuv420p10le \
+         -c:v libsvtav1 -preset 12 -b:v 8M \
+         /app/probes/probe_4k_av1.mkv \
     && /usr/lib/jellyfin-ffmpeg/ffmpeg -y -hide_banner -loglevel error \
-         -f lavfi -i mandelbrot=size=3840x2160:rate=24 -t 60 -pix_fmt yuv420p \
-         -c:v libx264 -preset medium -b:v 50M \
-         -x264-params "keyint=240:min-keyint=240" \
-         /app/clips/source_4k_h264.mkv \
+         -f lavfi -i mandelbrot=size=3840x2160:rate=24 -t 1 -pix_fmt yuv420p \
+         -c:v libx264 -preset ultrafast -b:v 8M \
+         /app/probes/probe_4k_h264.mkv \
     && /usr/lib/jellyfin-ffmpeg/ffmpeg -y -hide_banner -loglevel error \
-         -f lavfi -i mandelbrot=size=1920x1080:rate=24 -t 60 -pix_fmt yuv420p \
-         -c:v libx264 -preset medium -b:v 10M \
-         -x264-params "keyint=240:min-keyint=240" \
-         /app/clips/source_1080p_h264.mkv \
-    && /usr/lib/jellyfin-ffmpeg/ffmpeg -y -hide_banner -loglevel error \
-         -f lavfi -i mandelbrot=size=3840x2160:rate=24 -t 60 -pix_fmt yuv420p10le \
-         -c:v libx265 -preset medium -b:v 50M \
-         -x265-params "keyint=240:min-keyint=240:log-level=none:hdr10=1:repeat-headers=1:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1):max-cll=1000,400" \
-         /app/clips/source_4k_hdr.mkv
-# source_4k_hdr.mkv: the HDR10 master for the tone-mapping profile — same mandelbrot bitstream
-# recipe as the HEVC master plus BT.2020/PQ signalling + HDR10 mastering metadata, so the ONLY
-# extra work vs the HEVC board is the tone-map stage itself.
+         -f lavfi -i mandelbrot=size=3840x2160:rate=24 -t 1 -pix_fmt yuv420p10le \
+         -c:v libx265 -preset ultrafast -b:v 8M \
+         -x265-params "log-level=none:hdr10=1:repeat-headers=1:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1):max-cll=1000,400" \
+         /app/probes/probe_4k_hdr.mkv
 
 WORKDIR /app
 COPY benchmark.py scoreboard.html burnin.ass /app/
