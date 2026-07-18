@@ -274,19 +274,12 @@
   #batchpanel .bpd input{accent-color:#4da3ff;margin-right:5px}
   #batchpanel .bpn{font-size:12.5px;color:var(--muted);margin:8px 0}
   #batchpanel .bps{background:var(--accent);color:#04121f;font-weight:700;border:none;border-radius:9px;padding:8px 18px;font-size:14px;cursor:pointer}
-  #btabs{display:none;margin:16px auto 0;max-width:720px;text-align:left}
-  #btabs.show{display:block}
-  #btabs .tabstrip{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px}
-  #btabs .btab{background:#0e1928;border:1px solid #2c3e55;border-radius:9px 9px 0 0;padding:6px 12px;font-size:12.5px;color:var(--muted);cursor:pointer}
-  #btabs .btab.on{background:#16304d;color:var(--ink);border-color:var(--accent)}
-  #btabdetail{background:#0e1521;border:1px solid #25405d;border-radius:12px;padding:16px 20px}
-  #btabdetail .bd-big{font-size:44px;font-weight:900;color:var(--accent);line-height:1}
-  #btabdetail .bd-cap{font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted)}
-  #btabdetail .bd-prof{font-size:14.5px;color:#e8eef7;margin:6px 0 10px}
-  #btabdetail .bd-note{font-size:13px;color:var(--amber);margin-bottom:8px}
-  #btabdetail .bd-lv{display:flex;justify-content:space-between;font-size:13px;color:#cdd9e8;padding:3px 0;border-top:1px solid #16233a}
-  #btabdetail .bd-lvh{display:flex;justify-content:space-between;font-size:10.5px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);padding-bottom:4px;margin-top:10px}
-  #btabdetail .bd-spec{font-size:12px;color:var(--muted);margin-top:10px}
+  #ddetail{display:none;margin-top:26px;border-top:1px solid #1a2738;padding-top:20px}
+  #ddetail.show{display:block}
+  #batchbody .btr.clickable{cursor:pointer}
+  #batchbody .btr.clickable:hover .bdev{color:var(--accent)}
+  #batchbody .btr.rowsel{background:#132a44;border-radius:8px;margin:0 -10px;padding-left:10px;padding-right:10px;border-top-color:transparent}
+  #batchbody .btr.rowsel + .btr{border-top-color:transparent}
   #suballbtn{display:none;margin:14px auto 0;background:var(--accent);color:#04121f;font-weight:700;border:none;border-radius:10px;padding:10px 20px;font-size:14.5px;cursor:pointer}
   #suballbtn.show{display:inline-block}
   .bsub{font-size:12px;margin-left:8px}.bsub.ok{color:var(--green)}.bsub.err{color:var(--red)}.bsub.local{color:var(--muted)}
@@ -446,8 +439,8 @@
     <div class="desc" id="vdesc"></div>
     <div class="foot" id="vfoot"></div>
     <div id="batchbody"></div>
-    <div id="btabs"><div class="tabstrip"></div><div id="btabdetail"></div></div>
     <button id="suballbtn" onclick="submitBatch()"></button>
+    <div id="ddetail"><div class="cap" id="dcap"></div><div class="n" id="dnum"></div><div class="desc" id="ddesc"></div><div class="foot" id="dfoot"></div></div>
     <div id="convbody"></div>
     <div id="vscpu"></div>
     <div id="vhistory"></div>
@@ -654,54 +647,46 @@ function renderScreens(s, vendor){
 
   if(ui === "done"){
     const r = s.result || {};
-    const capped = s.cap_reason === "session";
-    const inC = r.input_codec || s.selected_input || "hevc";
-    const srcL = CODEC_LABEL[inC] || inC.toUpperCase();
-    const outL = (CODEC_LABEL[r.codec] || (r.codec||"h264").toUpperCase()) + (r.ten_bit ? " 10-bit" : "");
-    const srcRes = RES_LABEL[r.source_res] || "4K", tgtRes = RES_LABEL[r.target_res] || "1080p";
-    const srcPart = r.custom_source ? (srcL+" (your file)") : (srcRes+" "+srcL);
-    const prof = srcPart + " → " + tgtRes + " " + outL
-      + (inC==="hdr" ? " (tone-mapped)" : "") + (r.subs_burn ? " + subs burned in" : "")
-      + (r.clip_verified===false ? " · locally generated clip — local-only" : "");
     v.classList.add("show");
     const batch = !!(s.batch && (s.batch_results||[]).length);
     document.getElementById("batchbody").classList.toggle("show", batch);
     if(!batch){
-      document.getElementById("btabs").classList.remove("show");
+      document.getElementById("ddetail").classList.remove("show");
       document.getElementById("suballbtn").classList.remove("show");
     }
     document.getElementById("copybtn").style.display = batch ? "none" : "";
     document.getElementById("pngbtn").style.display = batch ? "none" : "";
     if(batch){
-      // BATCH verdict: summary table first, then full per-run results in tabs
+      // BATCH verdict: summary table first; clicking a row shows the FULL standard verdict
+      // for that run beneath it — the SAME rendering as a single run, for consistency
       v.classList.remove("fail");
       document.getElementById("vcap").style.display = "";
       document.getElementById("vcap").textContent = "Batch results";
       document.getElementById("vnum").style.display = "none";
       const nOK = s.batch_results.filter(b=>!b.error).length;
-      document.getElementById("vdesc").innerHTML = nOK+" run"+(nOK!==1?"s":"")+" — summary below, click a tab for the full result";
+      document.getElementById("vdesc").innerHTML = nOK+" run"+(nOK!==1?"s":"")+" — summary below, click a run for its full result";
       document.getElementById("vfoot").textContent = "Runs are strictly sequential with a cool-down between — parallel GPUs would skew each other.";
-      renderBatchTabs(s);
       const comps = s.batch_results.filter(b=>b.full && b.comparable && !b.submitted).length;
       const sab = document.getElementById("suballbtn");
       sab.classList.toggle("show", !!(s.submit_url_set && comps));
       sab.textContent = "⇪ Submit "+comps+" result"+(comps!==1?"s":"")+" to the leaderboard";
-      document.getElementById("veff").innerHTML = "";
-      document.getElementById("vinsight").style.display = "none";
-      document.getElementById("vspecs").innerHTML = (r.os_version?("Unraid <b>"+r.os_version+"</b>"):"")+(r.kernel?(" · kernel "+r.kernel):"");
       document.getElementById("submitbtn").style.display = "none";
-      document.getElementById("convbody").classList.remove("show");
-      document.getElementById("vscpu").className = "";
       document.getElementById("vhistory").className = "";
       document.getElementById("reconv").classList.remove("show");
       document.getElementById("suberr").className = "";
       renderBatch(s);
+      // selected-row detail (default: first successful run)
+      const ok = s.batch_results;
+      if(BSEL >= ok.length || !ok[BSEL] || ok[BSEL].error || !ok[BSEL].full)
+        BSEL = ok.findIndex(b=>!b.error && b.full);
+      const sel = BSEL >= 0 ? ok[BSEL] : null;
+      document.getElementById("ddetail").classList.toggle("show", !!sel);
+      if(sel) renderRunDetail(s, sel.full, true);
+      else { document.getElementById("veff").innerHTML=""; document.getElementById("vinsight").style.display="none";
+             document.getElementById("convbody").classList.remove("show"); document.getElementById("vscpu").className="";
+             document.getElementById("vspecs").innerHTML=""; }
       return _doneTail(ui);
     }
-    document.getElementById("veff").innerHTML = effBlock(r);
-    document.getElementById("vinsight").textContent = r.power_insight || "";
-    document.getElementById("vinsight").style.display = r.power_insight ? "" : "none";
-    document.getElementById("vspecs").innerHTML = specLine(s);
     const sb = document.getElementById("submitbtn");
     sb.style.display = (s.submit_url_set && r.comparable) ? "" : "none";
     sb.disabled = !!s.submitted;
@@ -709,60 +694,7 @@ function renderScreens(s, vendor){
     const bb = document.getElementById("boardbtn");     // appears once THIS result is on the board
     bb.style.display = (s.submitted && s.board_url) ? "" : "none";
     if(s.board_url) bb.href = s.board_url;
-    const conv = (r.mode === "convert");
-    document.getElementById("convbody").classList.toggle("show", conv);
-    if(conv){
-      // CONVERSION verdict: two co-equal panels (speed | workers). No giant centre number —
-      // each panel carries its own headline, so the header is just the GPU + profile.
-      v.classList.remove("fail");
-      document.getElementById("vcap").style.display = "none";
-      document.getElementById("vnum").style.display = "none";
-      document.getElementById("vdesc").innerHTML = "<b>"+escHtml(s.selected_name)+"</b> — "+prof;
-      document.getElementById("vfoot").textContent = "";
-      document.getElementById("reconv").classList.remove("show");
-      renderConvBody(s, r);
-    } else {
-      // STREAMING verdict (max simultaneous)
-      document.getElementById("vcap").style.display = "";
-      document.getElementById("vnum").style.display = "";
-      const n = s.confirmed_max ?? 0;
-      const local = (r.comparable === false) ? ' <span style="color:var(--amber)">· local only</span>' : '';
-      document.getElementById("vcap").textContent = "Max sustained";
-      v.classList.toggle("fail", n === 0 && !capped);
-      // the big number is ALWAYS the measured sustained count — projections are throughput
-      // statements, never session counts (the patched-5090 experiment proved sessions wall
-      // on VRAM long before engine throughput runs out)
-      document.getElementById("vnum").textContent = n;
-      if(capped){
-        const lr = r.limit_reason || "session";
-        const thr = (s.projected_uncapped ?? r.projected);
-        const thrTxt = thr ? " Engine throughput ≈"+thr+"× realtime — headroom the sessions can't reach." : "";
-        let how, foot;
-        if(lr === "memory"){
-          const gb = r.vram_per_session_mb ? (r.vram_per_session_mb/1024).toFixed(1) : null;
-          how = " hit its VRAM ceiling at "+n+" streams ("+prof+")."
-            + (gb ? " Each stream holds ~"+gb+" GB of video memory" : "")
-            + (r.vram_clean_ceiling ? " — an otherwise-empty card could reach ~"+r.vram_clean_ceiling+"." : ".");
-          foot = "Every 4K session reserves decode/scale/encode buffers in VRAM; the card filled up before the encoders did."+thrTxt;
-        } else if(lr === "unknown"){
-          how = " stopped at "+n+" streams ("+prof+") — a stream failed to start for an unrecognised reason.";
-          foot = "Not a throughput failure (the running streams still had headroom), and neither the driver session cap nor the VRAM prediction explains it."+thrTxt;
-        } else {
-          how = " hit the driver's NVENC session limit at "+n+" streams ("+prof+").";
-          foot = "Consumer NVIDIA drivers cap concurrent NVENC sessions ("+n+" here). The cap is a driver limit, not the silicon."+thrTxt;
-        }
-        document.getElementById("vdesc").innerHTML = escHtml(s.selected_name)+how+local;
-        document.getElementById("vfoot").textContent = foot;
-      } else {
-        document.getElementById("vdesc").innerHTML =
-          escHtml(s.selected_name)+" — throughput equivalent of ~"+n+" simultaneous "+srcPart+" → "+(r.bitrate||"")+" "+tgtRes+" "+outL+" streams"+local;
-        document.getElementById("vfoot").textContent =
-          "Measured flat-out throughput ÷ realtime. A conservative ceiling, not a guaranteed concurrent-playback count.";
-      }
-      document.getElementById("reconv").classList.add("show");   // signpost to conversion mode
-    }
-    renderVsCpu(r);
-    renderHistory(s);
+    renderRunDetail(s, r, false);
     const se = document.getElementById("suberr");
     const seMsg = /^Submit (failed|rejected)/.test(s.message||"") ? s.message : "";
     se.textContent = seMsg; se.className = seMsg ? "show" : "";
@@ -783,7 +715,7 @@ function _doneTail(ui){
     document.getElementById("vscpu").className = "";
     document.getElementById("vhistory").className = "";
     document.getElementById("batchbody").classList.remove("show");
-    document.getElementById("btabs").classList.remove("show");
+    document.getElementById("ddetail").classList.remove("show");
     document.getElementById("suballbtn").classList.remove("show");
     document.getElementById("reconv").classList.remove("show");
     document.getElementById("suberr").className = "";
@@ -1254,7 +1186,8 @@ function renderBatch(s){
     const sub = b.submitted ? ' <span class="bsub ok">✓ submitted</span>'
       : b.submit_error ? ' <span class="bsub err" title="'+escHtml(b.submit_error)+'">✗</span>'
       : (b.full && !b.comparable) ? ' <span class="bsub local">local-only</span>' : '';
-    return '<div class="btr'+(i===bestIdx?' best':'')+'"><span class="bdev">'+(i===bestIdx?'★ ':'')
+    const clickable = !!b.full;
+    return '<div class="btr'+(i===bestIdx?' best':'')+(clickable?' clickable':'')+(i===BSEL&&clickable?' rowsel':'')+'" data-i="'+i+'"><span class="bdev">'+(i===bestIdx?'★ ':'')
       +escHtml(b.gpu)+(b.is_cpu?' <small>(CPU)</small>':'')
       +(profs.length>1&&b.profile?'<div><small>'+escHtml(b.profile)+'</small></div>':'')+sub+'</span>'
       +'<span class="bcell">'+headv+'</span>'
@@ -1266,6 +1199,10 @@ function renderBatch(s){
     '<div class="btr skip"><span class="bdev">'+escHtml(k.gpu)+'</span>'
     +'<span class="bcell">skipped — '+escHtml(k.reason||"")+'</span></div>').join("");
   document.getElementById("batchbody").innerHTML = '<div class="btable">'+head+body+skipped+'</div>';
+  document.querySelectorAll("#batchbody .btr.clickable").forEach(el=>el.addEventListener("click",()=>{
+    BSEL = parseInt(el.dataset.i, 10);
+    renderScreens(LAST, LAST.vendor);   // re-render: row highlight + detail beneath the summary
+  }));
 }
 function toggleBatchPanel(){
   document.getElementById("batchpanel").classList.toggle("show");
@@ -1311,40 +1248,102 @@ function startBatch(){
   post("/batch?d="+idxs.join(",")+"&kind="+batchKind());
 }
 function submitBatch(){ post("/submitbatch"); }
-let BTAB = 0;
-function batchDetailHtml(f){
-  if(!f) return "";
-  const streaming = f.mode==="streaming";
-  const big = streaming ? (f.max_sustained!=null?f.max_sustained:"—") : (fmt(f.single_stream)+"×");
-  const cap = streaming ? "max sustained streams" : "realtime per file";
-  let note = "";
-  if(f.capped && f.limit_reason==="memory") note = "hit its VRAM ceiling — engine throughput ≈"+(f.projected||"?")+"× realtime";
-  else if(f.capped) note = "driver session cap — engine throughput ≈"+(f.projected||"?")+"× realtime";
-  const lv = (f.per_level||[]).map(L=>'<div class="bd-lv"><span>'+L.n+' stream'+(L.n>1?'s':'')
-    +'</span><span>worst '+fmt(L.worst)+'×</span><span>combined '+fmt(L.combined)+'×</span></div>').join("");
-  const spec = [f.driver?("driver "+escHtml(f.driver)):null, f.ram?escHtml(f.ram):null,
-    f.cpu?escHtml(f.cpu):null, f.kernel?("kernel "+escHtml(f.kernel)):null].filter(Boolean).join(" · ");
-  return '<div class="bd-big">'+big+'</div><div class="bd-cap">'+cap+'</div>'
-    +'<div class="bd-prof">'+escHtml(f.gpu)+' — '+escHtml(f.profile||"")
-    +(f.comparable?'':' · <span class="bsub local">local-only</span>')+'</div>'
-    +(note?'<div class="bd-note">'+note+'</div>':'')
-    +effBlock(f)
-    +'<div class="bd-lvh"><span>Level</span><span>Worst</span><span>Combined</span></div>'+lv
-    +(spec?'<div class="bd-spec">'+spec+'</div>':'');
+let BSEL = 0;   // selected batch row (index into batch_results)
+function profOfResult(r){
+  const inC = r.input_codec || "hevc";
+  const srcL = CODEC_LABEL[inC] || inC.toUpperCase();
+  const outL = (CODEC_LABEL[r.codec] || (r.codec||"h264").toUpperCase()) + (r.ten_bit ? " 10-bit" : "");
+  const srcRes = RES_LABEL[r.source_res] || "4K", tgtRes = RES_LABEL[r.target_res] || "1080p";
+  const srcPart = r.custom_source ? (srcL+" (your file)") : (srcRes+" "+srcL);
+  return {srcPart, tgtRes, outL,
+    prof: srcPart + " → " + tgtRes + " " + outL
+      + (inC==="hdr" ? " (tone-mapped)" : "") + (r.subs_burn ? " + subs burned in" : "")
+      + (r.clip_verified===false ? " · locally generated clip — local-only" : "")};
 }
-function renderBatchTabs(s){
-  const rows = s.batch_results||[];
-  const el = document.getElementById("btabs");
-  const ok = rows.filter(r=>!r.error && r.full);
-  if(!ok.length){ el.classList.remove("show"); return; }
-  el.classList.add("show");
-  if(BTAB>=ok.length) BTAB=0;
-  el.querySelector(".tabstrip").innerHTML = ok.map((r,i)=>{
-    const label = escHtml((r.gpu||"").split(" ")[0])+" · "+(CODEC_LABEL[r.input_codec]||r.input_codec||"").split(" ")[0]+(r.subs?"+subs":"");
-    return '<button class="btab'+(i===BTAB?' on':'')+'" data-t="'+i+'">'+label+'</button>';
-  }).join("");
-  el.querySelectorAll(".btab").forEach(b=>b.addEventListener("click",()=>{BTAB=parseInt(b.dataset.t,10);renderBatchTabs(LAST);}));
-  document.getElementById("btabdetail").innerHTML = batchDetailHtml(ok[BTAB].full);
+function specLineR(r){
+  // spec line built PURELY from the stored result — batch rows have no live-session globals
+  const bits = [];
+  if(r.is_cpu){
+    bits.push("encoder <b>"+(r.cpu_encoder||"software")+" · "+(r.cpu_preset||"")+"</b>");
+    if(r.cpu) bits.push(escHtml(r.cpu)+(r.cpu_threads?" (<b>"+r.cpu_threads+" threads</b>)":""));
+    if(r.ram) bits.push("RAM <b>"+escHtml(r.ram)+"</b>");
+  } else {
+    const drv = drvStr(r); if(drv) bits.push("driver <b>"+escHtml(drv)+"</b>");
+    if(r.ram) bits.push("RAM <b>"+escHtml(r.ram)+"</b>");
+    if(r.cpu) bits.push(escHtml(r.cpu));
+  }
+  if(r.os_version) bits.push("Unraid <b>"+escHtml(r.os_version)+"</b>");
+  if(r.kernel) bits.push("kernel "+escHtml(r.kernel));
+  return bits.join(" · ");
+}
+// The ONE verdict-body renderer — the single-run page and the batch row detail use the SAME
+// code so every run, everywhere, is presented identically (user requirement). forBatch writes
+// the headline into the d* elements under the summary and derives everything from the stored
+// result; single-run keeps today's exact behaviour (incl. live-only extras: history, sparkline,
+// mode signpost, fail styling).
+function renderRunDetail(s, r, forBatch){
+  const v = document.getElementById("verdict");
+  const T = forBatch ? {cap:"dcap",num:"dnum",desc:"ddesc",foot:"dfoot"}
+                     : {cap:"vcap",num:"vnum",desc:"vdesc",foot:"vfoot"};
+  const el = id => document.getElementById(id);
+  const po = profOfResult(r);
+  const name = forBatch ? (r.gpu||"") : (s.selected_name||"");
+  const capped = forBatch ? !!r.capped : (s.cap_reason === "session");
+  const n = forBatch ? (r.max_sustained ?? 0) : (s.confirmed_max ?? 0);
+  const projected = forBatch ? r.projected : (s.projected_uncapped ?? r.projected);
+  el("veff").innerHTML = effBlock(r);
+  el("vinsight").textContent = r.power_insight || "";
+  el("vinsight").style.display = r.power_insight ? "" : "none";
+  el("vspecs").innerHTML = forBatch ? specLineR(r) : specLine(s);
+  const conv = (r.mode === "convert");
+  el("convbody").classList.toggle("show", conv);
+  if(conv){
+    if(!forBatch) v.classList.remove("fail");
+    el(T.cap).style.display = "none";
+    el(T.num).style.display = "none";
+    el(T.desc).innerHTML = "<b>"+escHtml(name)+"</b> — "+po.prof;
+    el(T.foot).textContent = "";
+    document.getElementById("reconv").classList.remove("show");
+    renderConvBody(s, r);
+  } else {
+    el(T.cap).style.display = "";
+    el(T.num).style.display = "";
+    const local = (r.comparable === false) ? ' <span style="color:var(--amber)">· local only</span>' : '';
+    el(T.cap).textContent = "Max sustained";
+    if(!forBatch) v.classList.toggle("fail", n === 0 && !capped);
+    // the big number is ALWAYS the measured sustained count — projections are throughput
+    // statements, never session counts (the patched-5090 experiment proved sessions wall
+    // on VRAM long before engine throughput runs out)
+    el(T.num).textContent = n;
+    if(capped){
+      const lr = r.limit_reason || "session";
+      const thrTxt = projected ? " Engine throughput ≈"+projected+"× realtime — headroom the sessions can't reach." : "";
+      let how, foot;
+      if(lr === "memory"){
+        const gb = r.vram_per_session_mb ? (r.vram_per_session_mb/1024).toFixed(1) : null;
+        how = " hit its VRAM ceiling at "+n+" streams ("+po.prof+")."
+          + (gb ? " Each stream holds ~"+gb+" GB of video memory" : "")
+          + (r.vram_clean_ceiling ? " — an otherwise-empty card could reach ~"+r.vram_clean_ceiling+"." : ".");
+        foot = "Every 4K session reserves decode/scale/encode buffers in VRAM; the card filled up before the encoders did."+thrTxt;
+      } else if(lr === "unknown"){
+        how = " stopped at "+n+" streams ("+po.prof+") — a stream failed to start for an unrecognised reason.";
+        foot = "Not a throughput failure (the running streams still had headroom), and neither the driver session cap nor the VRAM prediction explains it."+thrTxt;
+      } else {
+        how = " hit the driver's NVENC session limit at "+n+" streams ("+po.prof+").";
+        foot = "Consumer NVIDIA drivers cap concurrent NVENC sessions ("+n+" here). The cap is a driver limit, not the silicon."+thrTxt;
+      }
+      el(T.desc).innerHTML = escHtml(name)+how+local;
+      el(T.foot).textContent = foot;
+    } else {
+      el(T.desc).innerHTML =
+        escHtml(name)+" — throughput equivalent of ~"+n+" simultaneous "+po.srcPart+" → "+(r.bitrate||"")+" "+po.tgtRes+" "+po.outL+" streams"+local;
+      el(T.foot).textContent =
+        "Measured flat-out throughput ÷ realtime. A conservative ceiling, not a guaranteed concurrent-playback count.";
+    }
+    if(!forBatch) document.getElementById("reconv").classList.add("show");
+  }
+  renderVsCpu(r);
+  if(!forBatch) renderHistory(s);
 }
 
 function resultText(){
