@@ -1028,9 +1028,14 @@ class TestRunComparable(unittest.TestCase):
         self.assertFalse(benchmark.is_run_comparable(**{**self.ARGS, "clip_verified": False}))
 
     def test_existing_gates_still_hold(self):
-        for k, v in [("mode", "convert"), ("custom_source", True), ("is_cpu", True),
+        for k, v in [("mode", "convert"), ("custom_source", True),
                      ("threshold", 0.9), ("hold", 12), ("settle", 2), ("target_res", "720p")]:
             self.assertFalse(benchmark.is_run_comparable(**{**self.ARGS, k: v}), k)
+
+    def test_cpu_runs_are_comparable(self):
+        # CPU software runs joined the leaderboard (2026-07-18): same clips, same rules, locked
+        # veryfast preset — as comparable as any GPU run (server enforces preset/encoder)
+        self.assertTrue(benchmark.is_run_comparable(**{**self.ARGS, "is_cpu": True}))
 
 
 class TestBatchJobs(unittest.TestCase):

@@ -34,7 +34,10 @@ async function sha256hex(s) {
 // ---- validation (the contract's server checklist) --------------------------------------------
 function num(v) { return typeof v === "number" && isFinite(v); }
 
-const VENDORS = ["intel", "amd", "nvidia"];
+const VENDORS = ["intel", "amd", "nvidia", "cpu"];   // "cpu" = software encoding (2026-07-18)
+// CPU submissions are honest only on the locked streaming preset + stock encoders — anything
+// else (slower presets, exotic encoders) would game quality/speed and isn't the shipped test
+const CPU_ENC = { h264: "libx264", hevc: "libx265", av1: "libsvtav1" };
 const IN_CODECS = ["h264", "hevc", "av1", "hdr"];   // "hdr" = the HDR10 tone-map profile
 const OUT_CODECS = ["h264", "hevc", "av1"];
 
@@ -69,10 +72,17 @@ function validate(env0) {
   if (typeof iid !== "string" || iid.length < 8 || iid.length > 64) return "bad install_id";
   const r = env0.result;
   if (!r || typeof r !== "object") return "missing result";
-  // re-derive comparability — never trust the flag alone
+  // re-derive comparability — never trust the flag alone (CPU software runs are ELIGIBLE
+  // since 2026-07-18: identical clips + rules; preset/encoder enforced below)
   const comparable = r.mode === "streaming" && r.source_res === "4k" && r.target_res === "1080p"
-    && !r.custom_source && !r.is_cpu && r.comparable === true;
+    && !r.custom_source && r.comparable === true;
   if (!comparable) return "not a comparable run";
+  // vendor must MATCH the device class — a CPU run can't wear a GPU vendor or vice versa
+  if (r.is_cpu === true) {
+    if (r.vendor !== "cpu") return "cpu run must have vendor cpu";
+    if (r.cpu_preset !== "veryfast") return "non-standard cpu preset";
+    if (r.cpu_encoder !== CPU_ENC[r.codec]) return "non-standard cpu encoder";
+  } else if (r.vendor === "cpu") return "vendor cpu requires is_cpu";
   const major = String(r.tool_version || "").split(".")[0];
   if (major !== ACCEPTED_MAJOR) return "unsupported tool version";
   // a lowered PASS_THRESHOLD inflates stream counts — only strict-realtime runs are comparable
@@ -654,7 +664,7 @@ function renderPills(){
 }
 function applySel(){PROFILE=profOf(SEL);SHOWALL=false;renderPills();loadBoard();}
 // ---- search, vendor chips, cross-profile strip ------------------------------------------------
-const VENDS=[["","All"],["intel","Intel"],["amd","AMD"],["nvidia","NVIDIA"]];
+const VENDS=[["","All"],["intel","Intel"],["amd","AMD"],["nvidia","NVIDIA"],["cpu","CPU"]];
 function renderChips(){
   document.getElementById("vchips").innerHTML=VENDS.map(v=>
     '<button class="vchip'+(VEND===v[0]?' on':'')+'" data-v="'+v[0]+'">'+v[1]+'</button>').join("");

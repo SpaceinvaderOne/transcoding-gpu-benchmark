@@ -1187,11 +1187,14 @@ def ensure_clip(source_res, input_codec, abort_event=None):
 
 def is_run_comparable(mode, source_res, target_res, custom_source, is_cpu,
                       threshold, hold, settle, clip_verified):
-    """The single leaderboard-eligibility gate: canonical streaming 4K→1080p on a real GPU,
-    strict 1.0× rule, standard hold/settle, and a VERIFIED canonical clip (shipped or
-    hash-matched — a locally generated variant bitstream is never comparable)."""
+    """The single leaderboard-eligibility gate: canonical streaming 4K→1080p, strict 1.0×
+    rule, standard hold/settle, and a VERIFIED canonical clip (shipped or hash-matched — a
+    locally generated variant bitstream is never comparable). CPU software runs joined the
+    board 2026-07-18: identical clips + rules + a code-locked veryfast preset make them as
+    comparable as GPU runs (the server additionally enforces preset/encoder); is_cpu is kept
+    in the signature for call-site clarity and future policy."""
     return (mode == "streaming" and is_comparable(source_res, target_res)
-            and not custom_source and not is_cpu and threshold == 1.0
+            and not custom_source and threshold == 1.0
             and hold >= 25 and settle >= 5 and clip_verified)
 
 
