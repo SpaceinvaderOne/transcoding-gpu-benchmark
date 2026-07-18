@@ -274,7 +274,10 @@
   #batchpanel .bpd input{accent-color:#4da3ff;margin-right:5px}
   #batchpanel .bpn{font-size:12.5px;color:var(--muted);margin:8px 0}
   #batchpanel .bprow{display:flex;align-items:center;gap:10px;font-size:13px;color:var(--muted);margin:5px 0}
-  #batchpanel .bpouts{display:inline-flex;gap:6px;vertical-align:middle;flex-wrap:wrap}
+  #batchpanel .bplab{min-width:60px}
+  #batchpanel .bphint{font-size:12px;color:var(--muted);margin:2px 0 4px}
+  #batchpanel .bpouts{display:inline-flex;gap:6px;vertical-align:middle;flex-wrap:nowrap}
+  #batchpanel .bps:disabled{opacity:.35;cursor:default}
   #batchpanel .bpo{background:#0e1928;border:1px solid #2c3e55;border-radius:999px;padding:3px 10px;font-size:12.5px;color:var(--muted);cursor:pointer}
   #batchpanel .bpo.on{background:var(--accent);color:#04121f;font-weight:700;border-color:var(--accent)}
   #batchpanel .bpo.dis{opacity:.35;cursor:default;pointer-events:none}
@@ -406,8 +409,9 @@
     <button id="allbtn" onclick="toggleBatchPanel()" title="Run several tests one after another (strictly sequential — parallel GPUs would skew each other). Pick the devices and whether to sweep every source codec or repeat the current test.">⚡ Batch tests</button>
     <div id="batchpanel">
       <div class="bpk" id="bpsweepui">
-        <div class="bprow">Sources <span class="bpouts" id="bpsrcs"></span></div>
-        <div class="bprow">Output <span class="bpouts" id="bpouts"></span> <span class="cmuted">— one run per selected source each device supports</span></div>
+        <div class="bprow"><span class="bplab">Sources</span><span class="bpouts" id="bpsrcs"></span></div>
+        <div class="bprow"><span class="bplab">Output</span><span class="bpouts" id="bpouts"></span></div>
+        <div class="bphint">One run per selected source each device supports.</div>
       </div>
       <div class="bpk" id="bpconvlbl" style="display:none">Current test on the selected devices</div>
       <div class="bpd" id="bpdevs"></div>
@@ -1276,10 +1280,10 @@ function renderBatchPanel(s){
     else if((g.decodes||[]).indexOf(s.selected_input||"hevc")>=0) runs += 1;
   });
   document.getElementById("bpnote").textContent =
-    runs+" run(s), strictly one at a time with a cool-down between"
+    (runs===0 ? "Nothing to run — select at least one device that can encode the chosen output."
+      : runs+" run(s), strictly one at a time with a cool-down between")
     +(sitout.length ? " · will sit out — can't encode "+(CODEC_LABEL[outc]||outc).split(" ")[0]+": "+sitout.join(", ") : "")
-    +(subs&&kind==="sweep"&&BSRC.has("hdr") ? " · subtitles ON — HDR sits out" : "")
-    +(runs>6 ? " · this can take a while on fast GPUs" : "");
+    +(subs&&kind==="sweep"&&BSRC.has("hdr") ? " · subtitles ON — HDR sits out" : "");
   panel.querySelector(".bps").disabled = runs===0;
 }
 function startBatch(){
