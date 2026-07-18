@@ -808,11 +808,15 @@ function renderPicker(s){
 
 const RES_LABEL = {"4k":"4K","1080p":"1080p","720p":"720p"};
 function fillSel(id, opts, selected, labelFn){
+  // opts: strings, or {v, dis, why} — unsupported entries stay VISIBLE but greyed out, so the
+  // user learns "this GPU can't do it" rather than "the tool doesn't offer it"
   const sel = document.getElementById(id);
-  const sig = opts.join(",")+"|"+selected;
+  const norm = opts.map(o => typeof o === "string" ? {v:o} : o);
+  const sig = norm.map(o=>o.v+(o.dis?"!":"")).join(",")+"|"+selected;
   if(sel.dataset.sig !== sig){
     sel.dataset.sig = sig;
-    sel.innerHTML = opts.map(o=>'<option value="'+o+'"'+(o===selected?' selected':'')+'>'+labelFn(o)+'</option>').join("");
+    sel.innerHTML = norm.map(o=>'<option value="'+o.v+'"'+(o.v===selected?' selected':'')
+      +(o.dis?' disabled':'')+'>'+labelFn(o.v)+(o.dis&&o.why?' — '+o.why:'')+'</option>').join("");
   }
 }
 function srcCodecs(s, g){
@@ -851,8 +855,11 @@ function renderInput(s){
   sresSel.style.display = conv ? "" : "none";
   sresFx.style.display = conv ? "none" : "";
   sresFx.textContent = "4K";
-  const codecs = srcCodecs(s, g); if(!codecs.length) codecs.push(s.selected_input||"hevc");
-  fillSel("inputc", codecs, s.selected_input, c=>CODEC_LABEL[c]||c);
+  const sr2 = s.selected_source_res || "4k";
+  const shipped = ((s.source_codecs_by_res||{})[sr2]) || ["hevc"];
+  const srcOpts = shipped.map(c => (g.decodes||[]).indexOf(c)>=0 ? {v:c}
+    : {v:c, dis:true, why:(c==="hdr"?"can't tone-map":"can't decode")});
+  fillSel("inputc", srcOpts, s.selected_input, c=>CODEC_LABEL[c]||c);
   fillSel("sres", s.source_res_options||["4k"], s.selected_source_res||"4k", r=>RES_LABEL[r]||r);
 }
 function renderCodec(s){
@@ -861,7 +868,9 @@ function renderCodec(s){
   const g = (s.gpus||[]).find(x=>x.idx===s.selected_idx);
   if(!g){ row.style.display="none"; return; }
   row.style.display="flex";
-  fillSel("codec", g.codecs||["h264"], s.selected_codec, c=>CODEC_LABEL[c]||c);
+  const outOpts = ["h264","hevc","av1"].map(c => (g.codecs||["h264"]).indexOf(c)>=0 ? {v:c}
+    : {v:c, dis:true, why:"can't encode"});
+  fillSel("codec", outOpts, s.selected_codec, c=>CODEC_LABEL[c]||c);
   const sr = s.selected_source_res||"4k";
   fillSel("tres", (s.target_res_by_source||{})[sr]||["1080p"], s.selected_target_res||"1080p", r=>RES_LABEL[r]||r);
 }
@@ -1215,6 +1224,12 @@ function batchKind(){
 function renderBatchPanel(s){
   const panel = document.getElementById("batchpanel");
   if(!panel.classList.contains("show")) return;
+  // convert mode: the source sweep answers a question nobody asks there (you know your
+  // library's codec) — only the cross-device compare is offered; streaming gets both
+  const convMode = (s.selected_mode||"streaming")==="convert";
+  const sweepLbl = panel.querySelector('input[value="sweep"]').closest("label");
+  sweepLbl.style.display = convMode ? "none" : "";
+  if(convMode) panel.querySelector('input[value="current"]').checked = true;
   const gpus = (s.gpus||[]).filter(g=>g.available);
   const prevChecks = {};
   panel.querySelectorAll(".bpd input").forEach(c=>{prevChecks[c.dataset.i]=c.checked;});
