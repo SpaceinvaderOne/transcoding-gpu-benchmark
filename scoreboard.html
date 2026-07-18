@@ -231,6 +231,8 @@
   .subslbl{display:inline-flex;align-items:center;gap:8px;cursor:pointer;color:var(--ink);font-size:15px}
   .subslbl input{accent-color:#4da3ff;width:16px;height:16px;cursor:pointer}
   .subslbl .cmuted{color:#5d6b80;font-size:13px}
+  #readyboard{margin-top:14px;font-size:13.5px;color:var(--muted);text-decoration:none;border:1px solid #2c3e55;border-radius:999px;padding:7px 16px}
+  #readyboard:hover{color:var(--ink);border-color:var(--accent)}
   .codecrow .crlabel2{margin-left:6px}
   .codecrow #sres,.codecrow #tres{min-width:88px}
   .respart{display:inline-flex;align-items:center;gap:10px}
@@ -419,6 +421,7 @@
       <button class="bps" onclick="startBatch()">▶ Start batch</button>
     </div>
     <div class="rsrc" id="rsrc"></div>
+    <a id="readyboard" target="_blank" rel="noopener" style="display:none">🏆 View the community leaderboard</a>
   </div>
 
   <div id="warn">
@@ -637,6 +640,9 @@ function renderScreens(s, vendor){
     document.getElementById("allbtn").style.display =
       (hasAvail && !s.selected_custom) ? "" : "none";
     renderBatchPanel(s);
+    const rb = document.getElementById("readyboard");
+    rb.style.display = s.board_url ? "" : "none";
+    if(s.board_url) rb.href = s.board_url;
     document.getElementById("rsrc").innerHTML = !hasAvail
       ? "Pass <b>/dev/dri</b> (Intel/AMD) and/or add <b>--runtime=nvidia</b> (NVIDIA)."
       : (s.selected_custom
@@ -680,6 +686,10 @@ function renderScreens(s, vendor){
       const sab = document.getElementById("suballbtn");
       sab.classList.toggle("show", !!(s.submit_url_set && comps));
       sab.textContent = "⇪ Submit "+comps+" result"+(comps!==1?"s":"")+" to the leaderboard";
+      // once anything from this batch is on the board, offer the trip there
+      const bbb = document.getElementById("boardbtn");
+      bbb.style.display = (s.board_url && s.batch_results.some(b=>b.submitted)) ? "" : "none";
+      if(s.board_url) bbb.href = s.board_url;
       document.getElementById("submitbtn").style.display = "none";
       document.getElementById("vhistory").className = "";
       document.getElementById("reconv").classList.remove("show");
