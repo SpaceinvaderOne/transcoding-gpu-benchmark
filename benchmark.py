@@ -86,6 +86,8 @@ CPU_ENCODERS    = {"h264": "libx264", "hevc": "libx265", "av1": "libsvtav1"}
 SAMPLE_INTERVAL = float(_env("SAMPLE_INTERVAL", "1.0"))
 DMI_TABLE       = _env("DMI_TABLE", "/dmi/DMI")   # raw SMBIOS table (optional RO mount)
 UNRAID_VER_FILE = _env("UNRAID_VER_FILE", "/unraid-version")  # optional RO mount
+DYNAMIX_CFG     = _env("DYNAMIX_CFG", "/dynamix.cfg")  # optional RO mount of Unraid's
+                                                       # dynamix.cfg (temperature unit)
 # leaderboard endpoint — hardcoded by policy (changed only by shipping a new image version);
 # will move to gpu.spaceinvader.one once the domain's DNS is on Cloudflare. Setting the env var
 # to empty/whitespace disables submission entirely (the Submit button never shows).
@@ -517,6 +519,14 @@ def unraid_version():
         return m.group(1) if m else (txt.strip() or None)
     except Exception:
         return None
+
+
+def parse_display_unit(text):
+    """Temperature unit ("C"/"F") from Unraid's dynamix.cfg ([display] unit="F").
+    Anything missing or unrecognised falls back to Celsius — this only sets the UI
+    default; all stored/submitted temperatures stay Celsius regardless."""
+    m = re.search(r'^unit="([CF])"', text or "", re.M)
+    return m.group(1) if m else "C"
 
 
 def _read(path):
@@ -3347,6 +3357,7 @@ def main():
     scan = list_custom_files()       # enumerate any BYO clips in the /input drop folder
     clips = clips_status()
     publish(ui="idle", phase="idle", message=msg, source_ready=source_ready(),
+            temp_unit=parse_display_unit(_read(DYNAMIX_CFG)),
             clips=clips, clips_shipped=all(c["status"] == "shipped" for c in clips),
             gpus=public_gpus(_DETECTED), submit_url_set=bool(SUBMIT_URL),
             # public leaderboard page = the submit endpoint's origin (for the View button)

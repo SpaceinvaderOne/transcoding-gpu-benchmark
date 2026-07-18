@@ -590,6 +590,16 @@ function teleChip(k,v,accent,title){
   return '<div class="t'+(accent?' accent':'')+'"'+(title?' title="'+title+'"':'')+
          '><div class="tk">'+k+'</div><div class="tv">'+v+'</div></div>';
 }
+// temperature display unit: browser override > server's Unraid dashboard setting > °C.
+// Data is always °C internally — this is presentation only.
+function tempUnit(s){ return localStorage.getItem("tempUnit") || s.temp_unit || "C"; }
+function tempDisplay(c, s){
+  return (tempUnit(s)==="F") ? Math.round(c*9/5+32)+"°F" : Math.round(c)+"°C";
+}
+function toggleTempUnit(){
+  localStorage.setItem("tempUnit", tempUnit(LAST)==="F" ? "C" : "F");
+  if(LAST) renderTelemetry(LAST);
+}
 function renderTelemetry(s){
   const t = s.telemetry || {}; const out = [];
   document.getElementById("telelabel").textContent =
@@ -611,7 +621,9 @@ function renderTelemetry(s){
       "includes some CPU overhead and assumes an otherwise-idle box. Rough figure."));
   else if(t.power!=null) out.push(teleChip("Power", Math.round(t.power)+" W", true));
   else if(t.power_pkg!=null) out.push(teleChip("Pkg power", Math.round(t.power_pkg)+" W"));
-  if(t.temp!=null) out.push(teleChip("Temp", Math.round(t.temp)+"°C"));
+  if(t.temp!=null) out.push('<div class="t" style="cursor:pointer" onclick="toggleTempUnit()" '+
+    'title="Click to switch °C/°F. The default follows your Unraid display setting.">'+
+    '<div class="tk">Temp</div><div class="tv">'+tempDisplay(t.temp, s)+'</div></div>');
   if(t.throttle) out.push(teleChip("Throttle", "YES"));
   if(s.streams_per_watt!=null)
     out.push(teleChip("Streams/W"+(s.power_estimated?" (est.)":""), fmt(s.streams_per_watt), true,

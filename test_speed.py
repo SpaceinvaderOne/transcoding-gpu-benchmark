@@ -772,6 +772,31 @@ class TestProcStatCpu(unittest.TestCase):
         self.assertEqual(benchmark.cpu_stat_pct((200, 1000), (100, 2000)), 0.0)
 
 
+class TestDisplayUnit(unittest.TestCase):
+    """Temperature display unit from Unraid's dynamix.cfg (optional RO mount) — the tool
+    should show °F when the server dashboard does. Data stays °C everywhere; this only
+    drives the UI default (browser toggle can still override)."""
+    CFG_F = '[display]\ntty="15"\nunit="F"\nnumber=".,"\n'
+    CFG_C = '[display]\nunit="C"\n'
+
+    def test_fahrenheit(self):
+        self.assertEqual(benchmark.parse_display_unit(self.CFG_F), "F")
+
+    def test_celsius(self):
+        self.assertEqual(benchmark.parse_display_unit(self.CFG_C), "C")
+
+    def test_default_celsius(self):
+        self.assertEqual(benchmark.parse_display_unit(""), "C")
+        self.assertEqual(benchmark.parse_display_unit(None), "C")
+        self.assertEqual(benchmark.parse_display_unit('[display]\ntty="15"\n'), "C")
+        # docker creates a DIRECTORY at the target when the host file is missing —
+        # _read() returns None there, which must still land on C (covered above)
+
+    def test_not_fooled_by_lookalikes(self):
+        self.assertEqual(benchmark.parse_display_unit('somekey_unit="F"\n'), "C")
+        self.assertEqual(benchmark.parse_display_unit('unit="X"\n'), "C")
+
+
 class TestHdrTonemap(unittest.TestCase):
     """HDR is a pseudo input codec: transcode_cmd grows a tone-map stage per vendor (chains
     validated live on real hardware incl. the -stream_loop seam). Output is always SDR 8-bit."""
