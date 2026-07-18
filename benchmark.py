@@ -2589,11 +2589,14 @@ def batch_run(jobs, codec, source_res, target_res, mode):
         publish(ui="error", phase="error", batch=False, message=f"Batch error: {e}")
 
 
-def start_batch(device_idxs=None, kind="current"):
-    """Kick off a batch: kind "sweep" = every supported 4K source per selected device at the
-    current output; kind "current" = the current selection across the selected devices.
-    device_idxs None ⇒ all available. Idle only; shipped clips only (a custom file can't be
-    decoded everywhere so cross-device comparison would be apples-to-oranges)."""
+def start_batch(device_idxs=None, kind="current", codec_override=None):
+    """Kick off a batch: kind "sweep" = every supported 4K source per selected device at an
+    output the PANEL chooses (codec_override — the sweep's output is deliberately independent
+    of the main selection, whose dropdown is gated by the currently selected card; the batch
+    group may well include cards that can encode more). kind "current" = the current selection
+    across the selected devices (override ignored — "current" means current). device_idxs
+    None ⇒ all available. Idle only; shipped clips only (a custom file can't be decoded
+    everywhere so cross-device comparison would be apples-to-oranges)."""
     with RUN_LOCK:
         with STATE_LOCK:
             cur = STATE.get("ui")
@@ -2614,6 +2617,8 @@ def start_batch(device_idxs=None, kind="current"):
             source_res = "4k"                     # sweeps cover the 4K (leaderboard) source set
             if target_res not in target_res_options("4k"):
                 target_res = "1080p"
+            if codec_override in ("h264", "hevc", "av1"):
+                codec = codec_override
         avail = _available(_DETECTED)
         if device_idxs is not None:
             avail = [g for g in avail if g["idx"] in device_idxs]
@@ -3245,7 +3250,8 @@ class Handler(BaseHTTPRequestHandler):
                     idxs = [int(x) for x in d.split(",") if x != ""]
                 except ValueError:
                     idxs = None
-            ok = start_batch(idxs, _query_str(self.path, "kind") or "current")
+            ok = start_batch(idxs, _query_str(self.path, "kind") or "current",
+                             _query_str(self.path, "codec"))
         elif self.path.startswith("/submitbatch"):
             ok = submit_batch()
         elif self.path.startswith("/start"):
