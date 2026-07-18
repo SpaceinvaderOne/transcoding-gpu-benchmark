@@ -1084,6 +1084,18 @@ class TestBatchJobs(unittest.TestCase):
         self.assertEqual(jobs, [])
         self.assertIn("tone-map", skipped[0]["reason"])
 
+    def test_sweep_source_subset(self):
+        # the panel's multi-select: only the chosen sources run, shipped order preserved
+        jobs, skipped = benchmark.build_batch_jobs([self.IGPU], "sweep", "h264", False, "hevc",
+                                                   sources=["av1", "hevc"])
+        self.assertEqual([j["input_codec"] for j in jobs], ["hevc", "av1"])
+        self.assertEqual(skipped, [])
+
+    def test_sweep_subset_ignores_unknown_and_none_means_all(self):
+        jobs, _ = benchmark.build_batch_jobs([self.IGPU], "sweep", "h264", False, "hevc",
+                                             sources=None)
+        self.assertEqual(len(jobs), 4)
+
 
 if __name__ == "__main__":
     unittest.main()

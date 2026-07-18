@@ -273,7 +273,8 @@
   #batchpanel .bpd label{font-size:13.5px;color:#cdd9e8;background:#12233a;border:1px solid #2c3e55;border-radius:9px;padding:5px 10px;cursor:pointer}
   #batchpanel .bpd input{accent-color:#4da3ff;margin-right:5px}
   #batchpanel .bpn{font-size:12.5px;color:var(--muted);margin:8px 0}
-  #batchpanel .bpouts{display:inline-flex;gap:6px;vertical-align:middle}
+  #batchpanel .bprow{display:flex;align-items:center;gap:10px;font-size:13px;color:var(--muted);margin:5px 0}
+  #batchpanel .bpouts{display:inline-flex;gap:6px;vertical-align:middle;flex-wrap:wrap}
   #batchpanel .bpo{background:#0e1928;border:1px solid #2c3e55;border-radius:999px;padding:3px 10px;font-size:12.5px;color:var(--muted);cursor:pointer}
   #batchpanel .bpo.on{background:var(--accent);color:#04121f;font-weight:700;border-color:var(--accent)}
   #batchpanel .bpo.dis{opacity:.35;cursor:default;pointer-events:none}
@@ -404,10 +405,11 @@
     <button class="bigbtn" id="startbtn" onclick="start()">▶ START</button>
     <button id="allbtn" onclick="toggleBatchPanel()" title="Run several tests one after another (strictly sequential — parallel GPUs would skew each other). Pick the devices and whether to sweep every source codec or repeat the current test.">⚡ Batch tests</button>
     <div id="batchpanel">
-      <div class="bpk">
-        <label><input type="radio" name="bkind" value="sweep" checked onchange="renderBatchPanel(LAST)"> All sources → <span class="bpouts" id="bpouts"></span> <span class="cmuted">— one run per source each device supports</span></label>
-        <label><input type="radio" name="bkind" value="current" onchange="renderBatchPanel(LAST)"> Current test on the selected devices</label>
+      <div class="bpk" id="bpsweepui">
+        <div class="bprow">Sources <span class="bpouts" id="bpsrcs"></span></div>
+        <div class="bprow">Output <span class="bpouts" id="bpouts"></span> <span class="cmuted">— one run per selected source each device supports</span></div>
       </div>
+      <div class="bpk" id="bpconvlbl" style="display:none">Current test on the selected devices</div>
       <div class="bpd" id="bpdevs"></div>
       <div class="bpn" id="bpnote"></div>
       <button class="bps" onclick="startBatch()">▶ Start batch</button>
@@ -1222,25 +1224,34 @@ function toggleBatchPanel(){
   renderBatchPanel(LAST);
 }
 function batchKind(){
-  const r = document.querySelector('input[name="bkind"]:checked');
-  return r ? r.value : "sweep";
+  // ONE model per mode: streaming = the sources×output sweep (a single source chip replicates
+  // the old "current test"); convert = cross-device compare of the current selection
+  return ((LAST.selected_mode||"streaming")==="convert") ? "current" : "sweep";
 }
-let BOUT = null;   // the SWEEP's output codec — panel-owned, independent of the main selection
+let BOUT = null;                 // the sweep's output codec — panel-owned
+let BSRC = null;                 // the sweep's SELECTED SOURCES (Set) — panel-owned, default all
 function renderBatchPanel(s){
   const panel = document.getElementById("batchpanel");
   if(!panel.classList.contains("show")) return;
-  // convert mode: the source sweep answers a question nobody asks there (you know your
-  // library's codec) — only the cross-device compare is offered; streaming gets both
+  // convert mode: source sweeps aren't a convert question — only the cross-device compare
   const convMode = (s.selected_mode||"streaming")==="convert";
-  const sweepLbl = panel.querySelector('input[value="sweep"]').closest("label");
-  sweepLbl.style.display = convMode ? "none" : "";
-  if(convMode) panel.querySelector('input[value="current"]').checked = true;
+  document.getElementById("bpsweepui").style.display = convMode ? "none" : "";
+  document.getElementById("bpconvlbl").style.display = convMode ? "" : "none";
   const gpus = (s.gpus||[]).filter(g=>g.available);
   const prevChecks = {};
   panel.querySelectorAll(".bpd input").forEach(c=>{prevChecks[c.dataset.i]=c.checked;});
-  // sweep output pills: the UNION of what ANY available device can encode (the whole point —
-  // the group may encode more than the currently selected card); default = main selection if
-  // someone can do it, else H.264
+  const srcs4k = ((s.source_codecs_by_res||{})["4k"])||["hevc"];
+  if(BSRC===null) BSRC = new Set(srcs4k);            // default: everything
+  // source chips: multi-select; greyed when NO available device can decode that source
+  const decU = c => gpus.some(g=>(g.decodes||[]).indexOf(c)>=0);
+  document.getElementById("bpsrcs").innerHTML = srcs4k.map(c=>
+    '<span class="bpo'+(BSRC.has(c)?' on':'')+(decU(c)?'':' dis')+'" data-s="'+c+'">'
+    +(c==="hdr"?"HDR":(CODEC_LABEL[c]||c).split(" ")[0])+'</span>').join("");
+  document.querySelectorAll("#bpsrcs .bpo:not(.dis)").forEach(p=>p.addEventListener("click",()=>{
+    if(BSRC.has(p.dataset.s)) BSRC.delete(p.dataset.s); else BSRC.add(p.dataset.s);
+    renderBatchPanel(LAST);}));
+  // output pills: the UNION of what ANY available device can encode — the group may well
+  // encode more than the currently selected card
   const union = c => gpus.some(g=>(g.codecs||[]).indexOf(c)>=0);
   if(!BOUT || !union(BOUT)) BOUT = union(s.selected_codec||"h264") ? (s.selected_codec||"h264") : "h264";
   document.getElementById("bpouts").innerHTML = ["h264","hevc","av1"].map(c=>
@@ -1252,24 +1263,22 @@ function renderBatchPanel(s){
     '<label><input type="checkbox" data-i="'+g.idx+'" '
     +((prevChecks[g.idx]===undefined?true:prevChecks[g.idx])?'checked':'')
     +' onchange="renderBatchPanel(LAST)">'+escHtml(g.name)+(g.vendor==="cpu"?' (CPU)':'')+'</label>').join("");
-  // run-count estimate mirrors the server's job builder: sources ∩ decodes at the chosen
-  // output; sweep uses the PANEL's output, "current" uses the main selection's
+  // run-count estimate mirrors the server's job builder
   const kind = batchKind(), subs = !!s.selected_subs;
   const outc = kind==="sweep" ? BOUT : (s.selected_codec||"h264");
-  const srcs4k = ((s.source_codecs_by_res||{})["4k"])||["hevc"];
   let runs = 0; const sitout = [];
   gpus.forEach(g=>{
     const box = document.getElementById("bpdevs").querySelector('input[data-i="'+g.idx+'"]');
     if(box && !box.checked) return;
     if((g.codecs||[]).indexOf(outc)<0){ sitout.push(g.name); return; }
     if(kind==="sweep")
-      runs += srcs4k.filter(c=>(g.decodes||[]).indexOf(c)>=0 && !(subs&&c==="hdr")).length;
+      runs += srcs4k.filter(c=>BSRC.has(c) && (g.decodes||[]).indexOf(c)>=0 && !(subs&&c==="hdr")).length;
     else if((g.decodes||[]).indexOf(s.selected_input||"hevc")>=0) runs += 1;
   });
   document.getElementById("bpnote").textContent =
     runs+" run(s), strictly one at a time with a cool-down between"
     +(sitout.length ? " · will sit out — can't encode "+(CODEC_LABEL[outc]||outc).split(" ")[0]+": "+sitout.join(", ") : "")
-    +(subs&&kind==="sweep" ? " · subtitles ON — every run burns subs, HDR sits out" : "")
+    +(subs&&kind==="sweep"&&BSRC.has("hdr") ? " · subtitles ON — HDR sits out" : "")
     +(runs>6 ? " · this can take a while on fast GPUs" : "");
   panel.querySelector(".bps").disabled = runs===0;
 }
@@ -1278,7 +1287,9 @@ function startBatch(){
   if(!idxs.length) return;
   document.getElementById("batchpanel").classList.remove("show");
   const kind = batchKind();
-  post("/batch?d="+idxs.join(",")+"&kind="+kind+(kind==="sweep"&&BOUT?("&codec="+BOUT):""));
+  post("/batch?d="+idxs.join(",")+"&kind="+kind
+    +(kind==="sweep"&&BOUT?("&codec="+BOUT):"")
+    +(kind==="sweep"&&BSRC?("&srcs="+[...BSRC].join(",")):""));
 }
 function submitBatch(){ post("/submitbatch"); }
 let BSEL = 0;   // selected batch row (index into batch_results)

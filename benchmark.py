@@ -901,7 +901,7 @@ def batch_skip_reason(gpu, input_codec, codec):
     return None
 
 
-def build_batch_jobs(devices, kind, output_codec, subs_on, selected_input):
+def build_batch_jobs(devices, kind, output_codec, subs_on, selected_input, sources=None):
     """Expand a batch request into sequential jobs [{gpu, input_codec, subs}] + skipped rows.
     kind "sweep" = every supported 4K source per device at the chosen output (device-grouped,
     shipped order) — the "how does this GPU handle every kind of source?" batch. kind
@@ -919,7 +919,10 @@ def build_batch_jobs(devices, kind, output_codec, subs_on, selected_input):
             skipped.append({"gpu": gpu["name"], "reason": f"can't encode {output_codec.upper()}"})
             continue
         if kind == "sweep":
-            for src in SOURCE_CODECS_BY_RES["4k"]:
+            # sources = the panel's multi-selected subset (shipped order preserved); None = all
+            want = [c for c in SOURCE_CODECS_BY_RES["4k"]
+                    if sources is None or c in sources]
+            for src in want:
                 if src not in gpu.get("decodes", []):
                     skipped.append({"gpu": gpu["name"],
                                     "reason": batch_skip_reason(gpu, src, output_codec)})
@@ -2589,7 +2592,7 @@ def batch_run(jobs, codec, source_res, target_res, mode):
         publish(ui="error", phase="error", batch=False, message=f"Batch error: {e}")
 
 
-def start_batch(device_idxs=None, kind="current", codec_override=None):
+def start_batch(device_idxs=None, kind="current", codec_override=None, sources=None):
     """Kick off a batch: kind "sweep" = every supported 4K source per selected device at an
     output the PANEL chooses (codec_override — the sweep's output is deliberately independent
     of the main selection, whose dropdown is gated by the currently selected card; the batch
@@ -2619,10 +2622,13 @@ def start_batch(device_idxs=None, kind="current", codec_override=None):
                 target_res = "1080p"
             if codec_override in ("h264", "hevc", "av1"):
                 codec = codec_override
+            if sources:
+                sources = [c for c in sources if c in SOURCE_CODECS_BY_RES["4k"]] or None
         avail = _available(_DETECTED)
         if device_idxs is not None:
             avail = [g for g in avail if g["idx"] in device_idxs]
-        jobs, skipped = build_batch_jobs(avail, kind, codec, subs, input_codec)
+        jobs, skipped = build_batch_jobs(avail, kind, codec, subs, input_codec,
+                                         sources if kind == "sweep" else None)
         if not jobs:
             return False
         labels = [_job_label(j, codec, source_res, target_res, mode) for j in jobs]
@@ -3250,8 +3256,10 @@ class Handler(BaseHTTPRequestHandler):
                     idxs = [int(x) for x in d.split(",") if x != ""]
                 except ValueError:
                     idxs = None
+            srcs = _query_str(self.path, "srcs")
             ok = start_batch(idxs, _query_str(self.path, "kind") or "current",
-                             _query_str(self.path, "codec"))
+                             _query_str(self.path, "codec"),
+                             srcs.split(",") if srcs else None)
         elif self.path.startswith("/submitbatch"):
             ok = submit_batch()
         elif self.path.startswith("/start"):
