@@ -362,7 +362,7 @@
   <div class="panel">
     <div class="label">Per-stream</div>
     <div class="cards" id="cards"></div>
-    <div class="label" style="margin-top:20px">GPU telemetry</div>
+    <div class="label" style="margin-top:20px" id="telelabel">GPU telemetry</div>
     <div class="tele" id="tele"></div>
     <div class="status" id="status"></div>
   </div>
@@ -592,7 +592,12 @@ function teleChip(k,v,accent,title){
 }
 function renderTelemetry(s){
   const t = s.telemetry || {}; const out = [];
-  // engine load (the star metric)
+  document.getElementById("telelabel").textContent =
+    (s.vendor==="cpu") ? "CPU telemetry" : "GPU telemetry";
+  // engine load (the star metric) — for the CPU device that's the CPU itself
+  if(t.cpu_load!=null) out.push(teleChip("CPU load", Math.round(t.cpu_load)+"%", true,
+    "Whole-box CPU utilisation (all cores) — the same figure as the Unraid dashboard, "+
+    "so other apps' load is included."));
   if(t.enc!=null) out.push(teleChip("Encoder", Math.round(t.enc)+"%", true));
   if(t.dec!=null) out.push(teleChip("Decoder", Math.round(t.dec)+"%"));
   if(t.engines){ Object.entries(t.engines).forEach(([n,b])=>{

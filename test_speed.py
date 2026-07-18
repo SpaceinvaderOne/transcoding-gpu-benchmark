@@ -740,6 +740,38 @@ class TestCpuLoadPct(unittest.TestCase):
         self.assertEqual(cpu_load_pct(64.0, 16), 100.0)   # clamped
 
 
+class TestProcStatCpu(unittest.TestCase):
+    """Instantaneous whole-box CPU busy% from /proc/stat deltas — the live tile for CPU-device
+    runs (loadavg is a 1-minute average, far too sluggish for a 1 Hz display)."""
+    STAT_A = "cpu  100 0 50 800 50 0 0 0 0 0\ncpu0 25 0 12 200 12 0 0 0 0 0\n"
+    STAT_B = "cpu  160 0 90 850 50 0 0 0 0 0\ncpu0 40 0 22 212 12 0 0 0 0 0\n"
+
+    def test_parse(self):
+        # busy = total - idle - iowait = 1000 - 800 - 50
+        self.assertEqual(benchmark.parse_proc_stat(self.STAT_A), (150, 1000))
+
+    def test_parse_bad(self):
+        self.assertIsNone(benchmark.parse_proc_stat(""))
+        self.assertIsNone(benchmark.parse_proc_stat(None))
+        self.assertIsNone(benchmark.parse_proc_stat("cpu  1 2\n"))       # too few fields
+        self.assertIsNone(benchmark.parse_proc_stat("cpu  a b c d\n"))   # non-numeric
+        self.assertIsNone(benchmark.parse_proc_stat("cpu0 1 2 3 4\n"))   # per-core only
+
+    def test_pct_delta(self):
+        a = benchmark.parse_proc_stat(self.STAT_A)
+        b = benchmark.parse_proc_stat(self.STAT_B)
+        # delta busy 100, delta total 150 -> 66.7%
+        self.assertEqual(benchmark.cpu_stat_pct(a, b), 66.7)
+
+    def test_pct_guards(self):
+        a = benchmark.parse_proc_stat(self.STAT_A)
+        self.assertIsNone(benchmark.cpu_stat_pct(None, a))
+        self.assertIsNone(benchmark.cpu_stat_pct(a, None))
+        self.assertIsNone(benchmark.cpu_stat_pct(a, a))                  # zero time delta
+        # counters never go backwards in reality, but a clamp guards a torn read
+        self.assertEqual(benchmark.cpu_stat_pct((200, 1000), (100, 2000)), 0.0)
+
+
 class TestHdrTonemap(unittest.TestCase):
     """HDR is a pseudo input codec: transcode_cmd grows a tone-map stage per vendor (chains
     validated live on real hardware incl. the -stream_loop seam). Output is always SDR 8-bit."""

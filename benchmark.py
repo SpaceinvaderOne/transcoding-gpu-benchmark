@@ -806,6 +806,33 @@ def cpu_load_pct(load1, ncpu):
     return round(max(0.0, min(100.0, load1 / ncpu * 100.0)), 1)
 
 
+def parse_proc_stat(text):
+    """(busy, total) jiffies from the aggregate `cpu ` line of /proc/stat, or None.
+    Host-wide even inside a container (the kernel is shared) — the same figure the
+    Unraid dashboard shows. Idle time = idle + iowait."""
+    for line in (text or "").splitlines():
+        if line.startswith("cpu "):
+            try:
+                vals = [int(x) for x in line.split()[1:]]
+            except ValueError:
+                return None
+            if len(vals) < 5:
+                return None
+            return sum(vals) - vals[3] - vals[4], sum(vals)
+    return None
+
+
+def cpu_stat_pct(prev, cur):
+    """Instantaneous CPU busy% between two parse_proc_stat samples ([0,100] or None).
+    loadavg is a 1-minute average — far too sluggish for the 1 Hz live tile."""
+    if not prev or not cur:
+        return None
+    dtotal = cur[1] - prev[1]
+    if dtotal <= 0:
+        return None
+    return round(max(0.0, min(100.0, (cur[0] - prev[0]) / dtotal * 100.0)), 1)
+
+
 def load_baseline(path=BASELINE_FILE):
     """Read the CPU-baseline map ({key: entry}); {} if missing/unreadable."""
     try:
@@ -3041,10 +3068,28 @@ def _amd_telemetry(gpu):
         _TELE_STOP.wait(1.0)
 
 
-def _intel_telemetry(gpu):
+def _cpu_telemetry(gpu):
+    """CPU-device sampler: whole-box CPU busy% from /proc/stat deltas at 1 Hz, plus package
+    temp. The iGPU engine tiles are meaningless for a software transcode (0% by definition) —
+    the load that matters IS the CPU. Package power comes from the RAPL thread when /powercap
+    is mounted (it also owns temp then), else the intel_gpu_top power-only fallback."""
+    prev = None
+    while not _TELE_STOP.is_set():
+        cur = parse_proc_stat(_read("/proc/stat"))
+        kw = {"cpu_load": cpu_stat_pct(prev, cur)}
+        prev = cur
+        if not _RAPL_ACTIVE:
+            kw["temp"] = read_cpu_package_temp()
+        _tele_set(**kw)
+        _TELE_STOP.wait(1.0)
+
+
+def _intel_telemetry(gpu, power_only=False):
     """Parse intel_gpu_top -J: engine %, frequency, GPU/Package power; temp from CPU package.
     No -d (the slot form is malformed for the shipped build and suppresses all output);
-    intel_gpu_top defaults to the Intel GPU, which is what we want."""
+    intel_gpu_top defaults to the Intel GPU, which is what we want. power_only publishes just
+    power_pkg — the CPU-device fallback on Intel boxes without the /powercap mount, where the
+    iGPU engines/clock would be noise on a software-transcode run."""
     cmd = ["intel_gpu_top", "-J", "-s", "1000"]
     try:
         p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
@@ -3079,6 +3124,8 @@ def _intel_telemetry(gpu):
                     if not _RAPL_ACTIVE:   # RAPL owns power_pkg when the mount is present
                         kw["power_pkg"] = (round(pw.get("Package"), 1)
                                            if pw.get("Package") else None)
+                    if power_only:
+                        kw = {"power_pkg": kw.get("power_pkg")}
                     _tele_set(**kw)
                 except Exception:
                     pass
@@ -3163,8 +3210,12 @@ def start_telemetry(gpu):
         TELEMETRY.clear()
     rapl = rapl_package_paths()
     _RAPL_ACTIVE = bool(rapl)
-    target = {"nvidia": _nvidia_telemetry, "amd": _amd_telemetry}.get(gpu["vendor"], _intel_telemetry)
+    target = {"nvidia": _nvidia_telemetry, "amd": _amd_telemetry,
+              "cpu": _cpu_telemetry}.get(gpu["vendor"], _intel_telemetry)
     threading.Thread(target=target, args=(gpu,), daemon=True).start()
+    if gpu["vendor"] == "cpu" and not rapl:
+        # package-power fallback: Intel box with PERFMON but no /powercap mount
+        threading.Thread(target=_intel_telemetry, args=(gpu, True), daemon=True).start()
     if rapl:
         threading.Thread(target=_rapl_telemetry, args=(rapl, gpu["vendor"] == "cpu"),
                          daemon=True).start()
