@@ -796,6 +796,27 @@ class TestProcStatCpu(unittest.TestCase):
         self.assertEqual(benchmark.cpu_stat_pct((200, 1000), (100, 2000)), 0.0)
 
 
+class TestOriginOk(unittest.TestCase):
+    """CSRF guard for the local controller: a cross-origin browser POST carries an Origin
+    header whose host won't match ours. Reject only when Origin is present AND mismatched —
+    same-origin page requests and non-browser clients (curl, no Origin) pass."""
+    def test_no_origin_passes(self):        # curl / same-origin navigations omit Origin
+        self.assertTrue(benchmark.origin_ok(None, "tower:8088"))
+        self.assertTrue(benchmark.origin_ok("", "tower:8088"))
+
+    def test_same_origin_passes(self):
+        self.assertTrue(benchmark.origin_ok("http://tower:8088", "tower:8088"))
+        self.assertTrue(benchmark.origin_ok("http://192.0.2.10:8088", "192.0.2.10:8088"))
+
+    def test_cross_origin_rejected(self):
+        self.assertFalse(benchmark.origin_ok("http://evil.example", "tower:8088"))
+        self.assertFalse(benchmark.origin_ok("https://tower:8088", "tower:9999"))
+
+    def test_null_and_garbage_origin_rejected(self):
+        self.assertFalse(benchmark.origin_ok("null", "tower:8088"))
+        self.assertFalse(benchmark.origin_ok("http://", "tower:8088"))
+
+
 class TestNvencLockState(unittest.TestCase):
     """Detect the keylase NVENC session-cap patch by scanning libnvidia-encode.so for the
     per-version stock vs patched byte signatures. Drives the leaderboard's locked/unlocked

@@ -3379,6 +3379,22 @@ def stop_telemetry():
 
 
 # ------------------------------------------------------------------ web server
+def origin_ok(origin, host):
+    """CSRF guard for mutating POSTs. A malicious page open in a LAN browser can fire a
+    cross-origin POST at this box; the browser stamps such a request with an Origin header whose
+    host won't match ours. Same-origin page requests either omit Origin or match it, and
+    non-browser clients (curl) omit it entirely. So: reject ONLY when Origin is present and its
+    host differs from our Host. (Our POST endpoints take query params with no body — the
+    'simple request' class CORS never preflights — so this header check is the real defence.)"""
+    if not origin:
+        return True
+    try:
+        oh = urllib.parse.urlparse(origin).netloc
+    except Exception:
+        return False
+    return bool(oh) and oh == host
+
+
 def _query_str(path, key):
     """Query param value, URL-DECODED — real media filenames carry spaces/parens, which the
     browser sends percent-encoded; matching them un-decoded silently rejects every selection."""
@@ -3408,10 +3424,25 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
+    # defence-in-depth headers for the local UI (no known XSS — strings are escaped — but these
+    # cost nothing). CSP allows inline script/style because scoreboard.html is self-contained;
+    # frame-ancestors none + X-Frame-Options block clickjacking (pairs with the CSRF guard).
+    _SEC_HEADERS = {
+        "X-Content-Type-Options": "nosniff",
+        "Referrer-Policy": "no-referrer",
+        "X-Frame-Options": "DENY",
+        "Content-Security-Policy": (
+            "default-src 'self'; script-src 'self' 'unsafe-inline'; "
+            "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+            "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'"),
+    }
+
     def _send(self, body, ctype, code=200):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Cache-Control", "no-store")
+        for k, v in self._SEC_HEADERS.items():
+            self.send_header(k, v)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         try:
@@ -3420,7 +3451,8 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     def do_GET(self):
-        if self.path.startswith("/state"):
+        path = urllib.parse.urlparse(self.path).path
+        if path == "/state.json":
             with STATE_LOCK:
                 body = json.dumps(STATE).encode()
             self._send(body, "application/json")
@@ -3432,64 +3464,68 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 self._send(b"scoreboard.html missing", "text/plain", 500)
 
-    def do_POST(self):
-        if self.path.startswith("/select"):
-            idx = _query_int(self.path, "i")
-            ok = select_gpu(idx) if idx is not None else False
-        elif self.path.startswith("/codec"):
-            c = _query_str(self.path, "c")
-            ok = select_codec(c) if c else False
-        elif self.path.startswith("/input"):
-            c = _query_str(self.path, "c")
-            ok = select_input(c) if c else False
-        elif self.path.startswith("/sres"):
-            r = _query_str(self.path, "r")
-            ok = select_source_res(r) if r else False
-        elif self.path.startswith("/tres"):
-            r = _query_str(self.path, "r")
-            ok = select_target_res(r) if r else False
-        elif self.path.startswith("/mode"):
-            m = _query_str(self.path, "m")
-            ok = select_mode(m) if m else False
-        elif self.path.startswith("/custom"):
-            ok = select_custom(_query_str(self.path, "f") or "")
-        elif self.path.startswith("/subs"):        # ("/submit" doesn't match this prefix)
-            ok = select_subs(_query_str(self.path, "b") == "1")
-        elif self.path.startswith("/fetchclips"):
-            ok = start_fetch_clips()
-        elif self.path.startswith("/startall"):   # legacy route (old tabs) — current-kind batch
-            ok = start_batch(None, "current")
-        elif self.path.startswith("/batch"):
-            d = _query_str(self.path, "d")
+    def _dispatch(self, path):
+        """Exact-path POST routing (no startswith aliasing / order dependence). Returns ok, or
+        None if the route emitted its own response already."""
+        p = self.path                                       # full path incl. query
+        if path == "/select":
+            idx = _query_int(p, "i"); return select_gpu(idx) if idx is not None else False
+        if path == "/codec":
+            c = _query_str(p, "c"); return select_codec(c) if c else False
+        if path == "/input":
+            c = _query_str(p, "c"); return select_input(c) if c else False
+        if path == "/sres":
+            r = _query_str(p, "r"); return select_source_res(r) if r else False
+        if path == "/tres":
+            r = _query_str(p, "r"); return select_target_res(r) if r else False
+        if path == "/mode":
+            m = _query_str(p, "m"); return select_mode(m) if m else False
+        if path == "/custom":
+            return select_custom(_query_str(p, "f") or "")
+        if path == "/subs":
+            return select_subs(_query_str(p, "b") == "1")
+        if path == "/fetchclips":
+            return start_fetch_clips()
+        if path == "/startall":                             # legacy route — current-kind batch
+            return start_batch(None, "current")
+        if path == "/batch":
+            d = _query_str(p, "d")
             idxs = None
             if d:
                 try:
                     idxs = [int(x) for x in d.split(",") if x != ""]
                 except ValueError:
-                    # a garbled device list must NOT silently widen to "all devices"
                     self._send(json.dumps({"ok": False}).encode(), "application/json")
-                    return
-            srcs = _query_str(self.path, "srcs")
-            ok = start_batch(idxs, _query_str(self.path, "kind") or "current",
-                             _query_str(self.path, "codec"),
-                             srcs.split(",") if srcs else None)
-        elif self.path.startswith("/submitbatch"):
-            ok = submit_batch()
-        elif self.path.startswith("/start"):
-            ok = start_run()
-        elif self.path.startswith("/continue"):
-            ok = continue_run()
-        elif self.path.startswith("/cancel"):
-            ok = cancel_run()
-        elif self.path.startswith("/abort"):
-            ok = abort_run()
-        elif self.path.startswith("/reset"):
-            ok = reset_run()
-        elif self.path.startswith("/submit"):
-            ok = submit_result()
-        else:
-            self._send(b'{"error":"not found"}', "application/json", 404)
+                    return None                             # a garbled device list ≠ all devices
+            srcs = _query_str(p, "srcs")
+            return start_batch(idxs, _query_str(p, "kind") or "current",
+                               _query_str(p, "codec"), srcs.split(",") if srcs else None)
+        if path == "/submitbatch":
+            return submit_batch()
+        if path == "/start":
+            return start_run()
+        if path == "/continue":
+            return continue_run()
+        if path == "/cancel":
+            return cancel_run()
+        if path == "/abort":
+            return abort_run()
+        if path == "/reset":
+            return reset_run()
+        if path == "/submit":
+            return submit_result()
+        self._send(b'{"error":"not found"}', "application/json", 404)
+        return None
+
+    def do_POST(self):
+        # CSRF: reject cross-origin browser POSTs (see origin_ok). Non-browser clients unaffected.
+        if not origin_ok(self.headers.get("Origin"), self.headers.get("Host")):
+            self._send(b'{"error":"cross-origin request refused"}', "application/json", 403)
             return
+        path = urllib.parse.urlparse(self.path).path
+        ok = self._dispatch(path)
+        if ok is None:
+            return                                          # the route sent its own response
         with STATE_LOCK:
             ui = STATE.get("ui")
         self._send(json.dumps({"ok": ok, "ui": ui}).encode(), "application/json")
