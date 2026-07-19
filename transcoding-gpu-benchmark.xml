@@ -10,9 +10,9 @@
   <Support>https://github.com/SpaceinvaderOne/transcoding-gpu-benchmark/issues</Support>
   <Project>https://github.com/SpaceinvaderOne/transcoding-gpu-benchmark</Project>
   <Overview>Measures the maximum SUSTAINED number of simultaneous 4K HEVC -&gt; 1080p H.264 (8 Mbit, strict &gt;= 1.0x realtime) transcodes a GPU can do, shown live on a web scoreboard you can watch in a browser. Supports Intel (VAAPI), AMD (VAAPI), NVIDIA (NVENC/NVDEC) and CPU software transcoding - you pick which device to test from the web UI. GPU SETUP: INTEL and AMD work OUT OF THE BOX via the /dev/dri device below. FOR NVIDIA make ONE change - add  --runtime=nvidia  to Extra Parameters (the NVIDIA variables are already set; the NVIDIA driver plugin must be installed; on an NVIDIA-only host you can also remove the /dev/dri device). Everything else is identical for all vendors. It ramps the stream count one at a time and reports the highest count where EVERY stream still runs at or above real-time (same pinned test clips across vendors, so the numbers are comparable - and you can submit yours to the community leaderboard). Built on the Jellyfin image only to reuse the jellyfin-ffmpeg binary and its validated driver stack - the Jellyfin server itself is NOT run (the entrypoint is overridden). This is a run-and-watch benchmark, not an always-on service: pick a GPU, start it, watch the scoreboard reach the limit, then stop it. Nothing else should be using the GPU while it runs, or the result will be skewed.</Overview>
-  <Category>Other:</Category>
+  <Category>Tools:</Category>
   <WebUI>http://[IP]:[PORT:8088]</WebUI>
-  <TemplateURL/>
+  <TemplateURL>https://raw.githubusercontent.com/SpaceinvaderOne/transcoding-gpu-benchmark/main/transcoding-gpu-benchmark.xml</TemplateURL>
   <Icon>https://raw.githubusercontent.com/SpaceinvaderOne/transcoding-gpu-benchmark/main/icon.png</Icon>
   <ExtraParams>--cap-add PERFMON</ExtraParams>
   <PostArgs/>
