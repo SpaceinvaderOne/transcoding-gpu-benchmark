@@ -1,8 +1,8 @@
 -- GPU Transcode Benchmark leaderboard (Cloudflare D1 / SQLite)
--- One row per (install_id, gpu, profile, cap_cfg); resubmits UPDATE (keep best). Raw envelope
--- kept for audit. cap_cfg (1 = driver-session-capped, same formula as the board's entity
--- split) is part of the IDENTITY: unlocking a driver creates a second row, never overwrites
--- the capped history.
+-- One row per (install_id, gpu, profile, hw_variant); resubmits UPDATE (keep best). Raw
+-- envelope kept for audit. hw_variant (''/locked/unlocked/unknown — the NVIDIA driver lock
+-- state, see nvencVariant) is part of the IDENTITY: a locked and an unlocked run of the same
+-- card are separate rows, so unlocking a driver never overwrites the locked history.
 CREATE TABLE IF NOT EXISTS submissions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   install_id TEXT NOT NULL,
@@ -27,8 +27,8 @@ CREATE TABLE IF NOT EXISTS submissions (
   updated_at INTEGER,
   ip_hash TEXT,
   raw TEXT,
-  cap_cfg INTEGER NOT NULL DEFAULT 0,
-  UNIQUE(install_id, gpu, profile, cap_cfg)
+  hw_variant TEXT NOT NULL DEFAULT '',
+  UNIQUE(install_id, gpu, profile, hw_variant)
 );
 CREATE INDEX IF NOT EXISTS idx_sub_profile ON submissions(profile, hidden);
 

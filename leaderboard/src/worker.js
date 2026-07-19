@@ -63,6 +63,20 @@ function expectedProfile(r) {
     + String(r.codec).toUpperCase() + (r.subs_burn ? " + subs" : "");
 }
 
+// NVIDIA NVENC session-cap patch state → the board's locked/unlocked IDENTITY axis (so a locked
+// and an unlocked run of the same card are always distinct rows — including when they stop at the
+// same number, which is the whole point). A patched driver is definitively "unlocked", a stock
+// one "locked". When the client couldn't detect it (driver version not in the signature table),
+// a session cap still PROVES the driver is locked; otherwise "unknown". Non-NVIDIA cards have no
+// lock concept ("" = a single entity, unchanged from before).
+function nvencVariant(vendor, nvencUnlocked, capped, limitReason) {
+  if (vendor !== "nvidia") return "";
+  if (nvencUnlocked === true) return "unlocked";
+  if (nvencUnlocked === false) return "locked";
+  const sess = capped && (limitReason == null || limitReason === "session");
+  return sess ? "locked" : "unknown";
+}
+
 function capStr(v, max) { return typeof v === "string" && v.length <= max; }
 
 function validate(env0) {
@@ -123,6 +137,7 @@ function validate(env0) {
   if (r.busy_load != null && (!num(r.busy_load) || r.busy_load < 0 || r.busy_load > 100))
     return "busy_load out of range";
   if (r.is_igpu != null && typeof r.is_igpu !== "boolean") return "bad is_igpu";
+  if (r.nvenc_unlocked != null && typeof r.nvenc_unlocked !== "boolean") return "bad nvenc_unlocked";
   for (const k of ["vram_per_session_mb", "vram_total_mb", "vram_free_start_mb", "vram_clean_ceiling"])
     if (r[k] != null && (!num(r[k]) || r[k] < 0 || r[k] > 10000000)) return k + " out of range";
   if (!num(r.single_stream) || r.single_stream <= 0 || r.single_stream > 100)
@@ -209,20 +224,18 @@ async function handleSubmit(request, env) {
     await env.DB.prepare("DELETE FROM ratelimit WHERE ts < ?").bind(hourAgo).run();
 
   const r = envelope.result;
-  // cap-state is part of the row IDENTITY (same formula as the board's entity split): a
-  // driver-session-capped config and an unlocked one are different hardware realities — an
-  // unlocked resubmission must create a SECOND row, never overwrite the capped history.
-  // (Memory-walled runs are cap_cfg 0 by design: the VRAM ceiling is the card's real limit,
-  // so keep-best against uncapped runs of the same config is legitimate.)
-  const capCfg = (r.capped === true
-                  && (r.limit_reason == null || r.limit_reason === "session")) ? 1 : 0;
-  // upsert: keep the BEST run per (install, gpu, profile, cap-state); resubmits update
+  // NVIDIA driver lock state is part of the row IDENTITY (see nvencVariant): a locked and an
+  // unlocked run of the same card are different hardware realities and must never overwrite
+  // each other. Non-NVIDIA → "" (single entity). This supersedes the earlier cap_cfg proxy
+  // (which keyed on the run OUTCOME) with the actual driver CONFIG variable.
+  const hwVariant = nvencVariant(r.vendor, r.nvenc_unlocked, r.capped, r.limit_reason);
+  // upsert: keep the BEST run per (install, gpu, profile, hw_variant); resubmits update
   await env.DB.prepare(`
     INSERT INTO submissions (install_id, gpu, vendor, profile, tool_version, max_sustained,
       capped, projected, single_stream, peak_combined, watts_per_stream, power_estimated,
-      driver, os_version, kernel, ram, cpu, submitted_at, updated_at, ip_hash, raw, cap_cfg)
+      driver, os_version, kernel, ram, cpu, submitted_at, updated_at, ip_hash, raw, hw_variant)
     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-    ON CONFLICT(install_id, gpu, profile, cap_cfg) DO UPDATE SET
+    ON CONFLICT(install_id, gpu, profile, hw_variant) DO UPDATE SET
       max_sustained=excluded.max_sustained, capped=excluded.capped, projected=excluded.projected,
       single_stream=excluded.single_stream, peak_combined=excluded.peak_combined,
       watts_per_stream=excluded.watts_per_stream, power_estimated=excluded.power_estimated,
@@ -235,7 +248,7 @@ async function handleSubmit(request, env) {
       r.peak_combined, r.watts_per_stream ?? null, r.power_estimated ? 1 : 0,
       r.driver || null, r.os_version || null, r.kernel || null, r.ram || null, r.cpu || null,
       // server receipt time is authoritative (the client's submitted_at stays in raw only)
-      now, now, ipHash, body, capCfg).run();
+      now, now, ipHash, body, hwVariant).run();
   return json({ ok: true });
 }
 
@@ -255,6 +268,7 @@ async function handleTop(url, env) {
             CAST(json_extract(raw,'$.result.vram_total_mb') AS REAL) AS vt,
             CAST(json_extract(raw,'$.result.vram_free_start_mb') AS REAL) AS vf,
             json_extract(raw,'$.result.is_igpu') AS is_igpu,
+            hw_variant,
             json_extract(raw,'$.result.limit_reason') AS limit_reason
      FROM submissions WHERE profile = ? AND hidden = 0`).bind(profile).all();
 
@@ -270,20 +284,24 @@ async function handleTop(url, env) {
   // ENTITIES: iGPU RAM generation is intrinsic capability → separate entities ("UHD 770
   // (DDR5)"), like 3060 8GB vs 12GB. Cap-state remains the ONLY row-split for a given
   // entity. Cleanliness is a FILTER over runs, NEVER a row-split.
+  // ENTITY = base card + RAM generation (iGPU) + NVIDIA lock state. Lock state is stored as
+  // hw_variant at submit time (unlocked/locked/unknown/""); legacy rows (column added later,
+  // no client flag) fall back to the session-cap proxy so they still split correctly.
   const byKey = new Map();
   for (const row of results) {
     const igpu = row.is_igpu === 1 || row.is_igpu === true || row.ram != null;
     const gen = igpu ? (ramGen(row.ram) || "RAM unknown") : null;
     const entity = gen ? row.gpu + " (" + gen + ")" : row.gpu;
-    // the config split is SESSION-capped vs everything else: a memory/unknown-walled run is
-    // the silicon genuinely delivering (grouping it with session-capped runs re-creates the
-    // median-15 blend). Legacy rows (no limit_reason) with capped=true WERE session caps.
+    const variant = row.hw_variant != null && row.hw_variant !== ""
+      ? row.hw_variant
+      : nvencVariant(row.vendor, null, row.capped, row.limit_reason);   // legacy backfill
     const sess = row.capped && (row.limit_reason == null || row.limit_reason === "session");
-    const fullEntity = entity + (sess ? " (driver session cap)" : "");
-    const k = fullEntity;
-    if (!byKey.has(k)) byKey.set(k, { entity: fullEntity, base_gpu: row.gpu, ram_gen: gen,
-      vendor: row.vendor, capped: sess, rows: [] });
-    byKey.get(k).rows.push({ ...row, clean: isClean(row) });
+    const k = entity + "|" + variant;
+    if (!byKey.has(k)) byKey.set(k, { entity, base_gpu: row.gpu, ram_gen: gen,
+      vendor: row.vendor, nvenc: variant, sessCount: 0, rows: [] });
+    const g = byKey.get(k);
+    if (sess) g.sessCount++;
+    g.rows.push({ ...row, clean: isClean(row) });
   }
 
   const stats = rows => rows.length ? {
@@ -301,10 +319,12 @@ async function handleTop(url, env) {
     const clean = stats(g.rows.filter(r => r.clean));
     const all = stats(g.rows);
     const shown = clean || all;                 // no clean runs ⇒ mark-and-show the loaded stats
+    const cappedMost = g.sessCount * 2 >= g.rows.length;   // majority session-capped
     return {
       gpu: g.entity, base_gpu: g.base_gpu, ram_gen: g.ram_gen, vendor: g.vendor,
-      session_capped: g.capped,
-      mostly_capped: g.capped,
+      nvenc: g.nvenc,                            // ""|locked|unlocked|unknown → board badge
+      session_capped: cappedMost,
+      mostly_capped: cappedMost,
       median_streams: shown.median, best_streams: all.best, min_streams: shown.min,
       median_wps: shown.median_wps, median_projected: shown.median_projected,
       count: all.count, clean_count: clean ? clean.count : 0,
@@ -337,25 +357,34 @@ async function handleDetail(url, env) {
   }
   const profile = url.searchParams.get("profile") || CANONICAL;
   const gen = url.searchParams.get("gen");         // iGPU entity filter (DDR4/DDR5/unknown)
-  const cap = url.searchParams.get("cap");         // entity cap-config filter (1=session-capped)
+  const hw = url.searchParams.get("hw");           // NVIDIA lock-state entity filter
   let where = "profile = ? AND gpu = ? AND hidden = 0";
+  const binds = [profile, gpu];
   if (gen === "RAM unknown") where += " AND ram IS NULL";
   else if (gen) where += " AND ram LIKE '" + gen.replace(/[^A-Z0-9]/gi, "") + "%'";
-  const sessSql = "(capped = 1 AND COALESCE(json_extract(raw,'$.result.limit_reason'),'session') = 'session')";
-  if (cap === "1") where += " AND " + sessSql;
-  else if (cap === "0") where += " AND NOT " + sessSql;
+  if (hw != null) {
+    // match the entity's lock state, honouring the legacy session-cap fallback for pre-column
+    // rows (hw_variant '' + a session cap reads as 'locked')
+    if (hw === "locked")
+      where += " AND (hw_variant = 'locked' OR (hw_variant = '' AND capped = 1 AND"
+             + " COALESCE(json_extract(raw,'$.result.limit_reason'),'session') = 'session'))";
+    else if (hw === "unknown")
+      where += " AND (hw_variant = 'unknown' OR (hw_variant = '' AND vendor = 'nvidia' AND NOT"
+             + " (capped = 1 AND COALESCE(json_extract(raw,'$.result.limit_reason'),'session') = 'session')))";
+    else { where += " AND hw_variant = ?"; binds.push(hw); }
+  }
   const { results: dist } = await env.DB.prepare(
     `SELECT ram, max_sustained AS streams, COUNT(*) AS count
-     FROM submissions WHERE ${where} GROUP BY ram, max_sustained`).bind(profile, gpu).all();
+     FROM submissions WHERE ${where} GROUP BY ram, max_sustained`).bind(...binds).all();
   const fields = `max_sustained, capped, projected, watts_per_stream, ram, cpu, driver,
                   os_version, updated_at,
                   json_extract(raw,'$.result.limit_reason') AS limit_reason`;
   const { results: top } = await env.DB.prepare(
     `SELECT ${fields} FROM submissions WHERE ${where}
-     ORDER BY max_sustained DESC, updated_at DESC LIMIT 3`).bind(profile, gpu).all();
+     ORDER BY max_sustained DESC, updated_at DESC LIMIT 3`).bind(...binds).all();
   const { results: recent } = await env.DB.prepare(
     `SELECT ${fields} FROM submissions WHERE ${where}
-     ORDER BY updated_at DESC LIMIT 10`).bind(profile, gpu).all();
+     ORDER BY updated_at DESC LIMIT 10`).bind(...binds).all();
   return jsonPub({ gpu, profile, dist, top, recent });
 }
 
@@ -441,6 +470,8 @@ tr.detail>td{background:#0a111d;padding:18px 22px}
 .lbadge{display:inline-block;font-size:10px;letter-spacing:.05em;text-transform:uppercase;border-radius:5px;padding:1px 6px;margin-left:4px}
 .lbadge.throughput{background:#123524;color:#2ecc71}.lbadge.session{background:#332b10;color:#f1c40f}
 .lbadge.memory{background:#301a34;color:#c77dff}.lbadge.unknown{background:#3a1414;color:#ff7675}
+.lock{display:inline-block;font-size:10px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;border-radius:5px;padding:1px 6px;margin-left:8px;vertical-align:middle}
+.lock.unl{background:#123524;color:#2ecc71}.lock.lok{background:#2a2f3a;color:#9fb3c8}
 .ramrow{display:flex;justify-content:space-between;font-size:14px;padding:5px 0;border-bottom:1px solid #141d2c}
 .ramrow:last-child{border-bottom:none}.ramrow b{font-variant-numeric:tabular-nums}
 .ramnote{font-size:12px;color:var(--muted);margin-top:8px;line-height:1.45}
@@ -619,7 +650,14 @@ function profLabel(p){
   // single \b is a backspace escape, not a regex word boundary.
   return esc(p.replace("->","→").replace(/\\b(H264|HEVC|AV1)\\b/g, m=>CODEC_NICE[m]||m));
 }
-async function toggle(tr, gpu, gen, cap){
+// NVIDIA driver lock badge — shown next to the card name so a locked and unlocked variant of
+// the same GPU read at a glance (and the drill-down filters by it). Non-NVIDIA / unknown = none.
+function lockBadge(v){
+  if(v==="unlocked") return '<span class="lock unl" title="NVENC session limit patched out — unlocked driver (nvidia-patch)">🔓 unlocked</span>';
+  if(v==="locked")   return '<span class="lock lok" title="Stock driver — the NVIDIA NVENC concurrent-session limit is in place">🔒 locked</span>';
+  return "";
+}
+async function toggle(tr, gpu, gen, hw){
   const open=tr.classList.contains("open");
   document.querySelectorAll("tr.detail").forEach(e=>e.remove());
   document.querySelectorAll("tr.open").forEach(e=>e.classList.remove("open"));
@@ -631,7 +669,7 @@ async function toggle(tr, gpu, gen, cap){
   try{
     const d=await (await fetch("/api/detail?gpu="+encodeURIComponent(gpu)
       +"&profile="+encodeURIComponent(PROFILE)+(gen?("&gen="+encodeURIComponent(gen)):"")
-      +"&cap="+(cap||"0"))).json();
+      +(hw?("&hw="+encodeURIComponent(hw)):""))).json();
     det.firstChild.innerHTML=detailHtml(d);
   }catch(e){ det.firstChild.textContent="Could not load details."; }
 }
@@ -764,8 +802,8 @@ function renderRows(){
   for(const r of shown) if(r.median_wps!=null&&(effMin==null||r.median_wps<effMin)) effMin=r.median_wps;
   tb.innerHTML=shown.map((r,i)=>{
     const cnt = r.understated ? (r.count+' run'+(r.count>1?'s':'')) : (r.clean_count+' clean run'+(r.clean_count>1?'s':''));
-    return '<tr class="gpurow'+(i===0?' top':'')+'" data-gpu="'+esc(r.base_gpu)+'" data-gen="'+esc(r.ram_gen||"")+'" data-cap="'+(r.session_capped?'1':'0')+'"><td class="rank">'+(i+1)+'</td>'
-      +'<td class="gpu"><span class="chev">▸</span>'+esc(r.gpu)+'<div class="v">'+esc(r.vendor||"")+'</div></td>'
+    return '<tr class="gpurow'+(i===0?' top':'')+'" data-gpu="'+esc(r.base_gpu)+'" data-gen="'+esc(r.ram_gen||"")+'" data-hw="'+esc(r.nvenc||"")+'"><td class="rank">'+(i+1)+'</td>'
+      +'<td class="gpu"><span class="chev">▸</span>'+esc(r.gpu)+lockBadge(r.nvenc)+'<div class="v">'+esc(r.vendor||"")+'</div></td>'
       +'<td class="num"><span class="big">'+r.median_streams+'</span>'
       +' <span class="ccount">('+cnt+')'+(r.provisional?' <span class="prov">provisional</span>':'')+'</span>'
       +(r.count>1&&r.min_streams!==r.best_streams?' <span class="range">('+r.min_streams+'–'+r.best_streams+')</span>':'')
@@ -777,7 +815,7 @@ function renderRows(){
       +(effMin!=null&&r.median_wps===effMin&&shown.length>1?'<span class="effbadge">⚡ most efficient</span>':'')+'</td>'
       +'<td class="num">'+r.count+'</td></tr>';
   }).join("");
-  tb.querySelectorAll("tr.gpurow").forEach(tr=>tr.addEventListener("click",()=>toggle(tr,tr.dataset.gpu,tr.dataset.gen,tr.dataset.cap)));
+  tb.querySelectorAll("tr.gpurow").forEach(tr=>tr.addEventListener("click",()=>toggle(tr,tr.dataset.gpu,tr.dataset.gen,tr.dataset.hw)));
   const sa=document.getElementById("showall");
   if(!filtered&&!SHOWALL&&rows.length>TOPN){
     sa.style.display="";

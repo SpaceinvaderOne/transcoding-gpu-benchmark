@@ -57,7 +57,7 @@ RUN mkdir -p /app/probes \
 #   an image whose boot capability probes silently hide options — fail the BUILD instead
 
 WORKDIR /app
-COPY benchmark.py scoreboard.html burnin.ass /app/
+COPY benchmark.py scoreboard.html burnin.ass nvenc_sigs.json /app/
 
 # Tunables (all overridable at `docker run` time with -e)
 ENV FFMPEG_BIN=/usr/lib/jellyfin-ffmpeg/ffmpeg \

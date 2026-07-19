@@ -796,6 +796,41 @@ class TestProcStatCpu(unittest.TestCase):
         self.assertEqual(benchmark.cpu_stat_pct((200, 1000), (100, 2000)), 0.0)
 
 
+class TestNvencLockState(unittest.TestCase):
+    """Detect the keylase NVENC session-cap patch by scanning libnvidia-encode.so for the
+    per-version stock vs patched byte signatures. Drives the leaderboard's locked/unlocked
+    NVIDIA entity split + badge."""
+    # a real pair (595.71.05): stock has test/jne, patched has sub eax,eax
+    SIGS = {"595.71.05": ["e85121feff4189c685c0", "e85121feff29c04189c6"],
+            "550.00": ["85c00f8596000000", "29c090909090909090"]}
+
+    def test_patched_is_unlocked(self):
+        lib = b"\x00\x00" + bytes.fromhex("e85121feff29c04189c6") + b"\xff\xff"
+        self.assertEqual(benchmark.nvenc_lock_state(lib, "595.71.05", self.SIGS), "unlocked")
+
+    def test_stock_is_locked(self):
+        lib = b"\x11" + bytes.fromhex("e85121feff4189c685c0") + b"\x22"
+        self.assertEqual(benchmark.nvenc_lock_state(lib, "595.71.05", self.SIGS), "locked")
+
+    def test_unknown_version_is_none(self):
+        lib = bytes.fromhex("e85121feff29c04189c6")
+        self.assertIsNone(benchmark.nvenc_lock_state(lib, "999.99", self.SIGS))
+
+    def test_neither_signature_present_is_none(self):
+        self.assertIsNone(benchmark.nvenc_lock_state(b"\x00" * 64, "595.71.05", self.SIGS))
+
+    def test_empty_or_missing(self):
+        self.assertIsNone(benchmark.nvenc_lock_state(b"", "595.71.05", self.SIGS))
+        self.assertIsNone(benchmark.nvenc_lock_state(None, "595.71.05", self.SIGS))
+        self.assertIsNone(benchmark.nvenc_lock_state(b"\x00", "595.71.05", {}))
+
+    def test_shipped_sig_table_loads_and_covers_5090_driver(self):
+        # the real committed data file must load and carry the driver the fleet runs
+        sigs = benchmark.load_nvenc_sigs()
+        self.assertIn("595.71.05", sigs)
+        self.assertEqual(len(sigs["595.71.05"]), 2)
+
+
 class TestDisplayUnit(unittest.TestCase):
     """Temperature display unit from Unraid's dynamix.cfg (optional RO mount) — the tool
     should show °F when the server dashboard does. Data stays °C everywhere; this only

@@ -117,6 +117,68 @@ MEMORY_CAP_PATTERNS = (
 )
 NVENC_CAP_PATTERNS = SESSION_CAP_PATTERNS + MEMORY_CAP_PATTERNS   # legacy: "any known ceiling"
 
+# NVENC session-limit patch detection (keylase/nvidia-patch). The patch NOPs the session-count
+# check inside libnvidia-encode.so; we detect it by scanning that library (bind-mounted into the
+# container by the NVIDIA runtime) for the per-driver-version stock vs patched byte signatures.
+# The signature table ships as data (nvenc_sigs.json, extracted from patch.sh) because you can
+# only PATCH a version the table covers — so any patched card is, by construction, detectable as
+# long as we ship the current table. Unknown version ⇒ None (fail safe, never a wrong answer).
+NVENC_SIGS_FILE = _env("NVENC_SIGS_FILE", os.path.join(APP_DIR, "nvenc_sigs.json"))
+NVENC_ENCODE_LIBS = (
+    "/usr/lib64/libnvidia-encode.so.",
+    "/usr/lib/x86_64-linux-gnu/libnvidia-encode.so.",
+    "/usr/lib/libnvidia-encode.so.",
+)
+
+
+def load_nvenc_sigs(path=NVENC_SIGS_FILE):
+    """{driver_version: [stock_hex, patched_hex]} or {} if the data file is missing."""
+    try:
+        with open(path) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def nvenc_lock_state(lib_bytes, driver_version, sigs):
+    """Driver NVENC session-cap state from the encode library's bytes:
+    'unlocked' (patched — cap removed), 'locked' (stock signature intact), or None (the driver
+    version isn't in the signature table, or neither signature is present — can't tell)."""
+    sig = sigs.get(driver_version or "")
+    if not sig or not lib_bytes:
+        return None
+    try:
+        stock, patched = bytes.fromhex(sig[0]), bytes.fromhex(sig[1])
+    except (ValueError, IndexError):
+        return None
+    if patched and patched in lib_bytes:
+        return "unlocked"
+    if stock and stock in lib_bytes:
+        return "locked"
+    return None
+
+
+def detect_nvenc_unlocked(driver_version, sigs=None):
+    """True/False/None — is this NVIDIA driver's NVENC session cap patched out? Locates the
+    encode library for the running driver version and scans it. None when undeterminable."""
+    if not driver_version:
+        return None
+    sigs = load_nvenc_sigs() if sigs is None else sigs
+    if driver_version not in sigs:
+        return None
+    for base in NVENC_ENCODE_LIBS:
+        lib = base + driver_version
+        try:
+            with open(lib, "rb") as f:
+                data = f.read()
+        except Exception:
+            continue
+        state = nvenc_lock_state(data, driver_version, sigs)
+        if state is not None:
+            return state == "unlocked"
+    return None
+
 
 # ------------------------------------------------- pure helpers (unit tested)
 def parse_progress_kv(line):
@@ -1397,10 +1459,13 @@ def detect_gpus():
     # NVIDIA via NVENC
     nv = _nvidia_smi_gpus()
     if nv:
+        sigs = load_nvenc_sigs()
         for g in nv:
             gpus.append({"vendor": "nvidia", "api": "nvenc", "name": g["name"],
                          "index": g["index"], "driver": g.get("driver"),
                          "kernel_driver": "nvidia",
+                         # is the driver's NVENC session cap patched out? (True/False/None)
+                         "nvenc_unlocked": detect_nvenc_unlocked(g.get("driver"), sigs),
                          "available": True, "note": None, "is_igpu": False})
     elif _nvidia_present_on_host():
         gpus.append({"vendor": "nvidia", "api": "nvenc", "name": "NVIDIA GPU (runtime not active)",
@@ -2045,6 +2110,8 @@ def _build_result(gpu, codec, confirmed_max, single, peak_combined, per_level,
         "vendor": gpu["vendor"], "gpu": gpu["name"], "api": gpu["api"],
         "custom_source": custom_source,   # local-only: never leaderboard-eligible
         "driver": gpu.get("driver"), "kernel_driver": gpu.get("kernel_driver"),
+        # NVIDIA session-cap patch state (True/False/None) — the locked/unlocked board split
+        "nvenc_unlocked": gpu.get("nvenc_unlocked"),
         "max_sustained": confirmed_max, "capped": capped, "projected": projected,
         "single_stream": single, "peak_combined": round(peak_combined, 2),
         "per_level": per_level,
