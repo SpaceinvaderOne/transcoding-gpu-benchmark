@@ -124,7 +124,10 @@ function validate(env0) {
   for (const [k, max] of [["driver", 60], ["os_version", 60], ["kernel", 60],
                           ["ram", 40], ["cpu", 120]])
     if (r[k] != null && !capStr(r[k], max)) return "bad " + k;
-  if (!Number.isInteger(r.max_sustained) || r.max_sustained < 1 || r.max_sustained > 128)
+  // caps match the per_level limits below (200 rows / 256 combined) so a run made with a
+  // raised MAX_STREAMS on a very fast card, exactly what the template tells you to do, can
+  // still submit rather than passing the client and getting rejected by the server
+  if (!Number.isInteger(r.max_sustained) || r.max_sustained < 1 || r.max_sustained > 200)
     return "max_sustained out of range";
   // display/classification fields: every stored value that later renders or steers the
   // clean-median / entity / cap-split logic gets a type+range check (defence in depth —
@@ -142,7 +145,7 @@ function validate(env0) {
     if (r[k] != null && (!num(r[k]) || r[k] < 0 || r[k] > 10000000)) return k + " out of range";
   if (!num(r.single_stream) || r.single_stream <= 0 || r.single_stream > 100)
     return "single_stream out of range";
-  if (!num(r.peak_combined) || r.peak_combined <= 0 || r.peak_combined > 128)
+  if (!num(r.peak_combined) || r.peak_combined <= 0 || r.peak_combined > 256)
     return "peak_combined out of range";
   for (const k of ["watts_per_stream", "peak_power_w", "load_power_w", "idle_power_w"])
     if (r[k] != null && (!num(r[k]) || r[k] < 0 || r[k] > 2000)) return k + " out of range";

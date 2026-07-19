@@ -339,8 +339,10 @@ class TestFitSeconds(unittest.TestCase):
         # 100 Mbit → 60 s would be 750 MB; must trim below 60
         self.assertLess(fit_seconds(100_000_000, self.BUDGET, want=60), 60.0)
 
-    def test_floor_respected(self):
-        self.assertEqual(fit_seconds(10_000_000_000, self.BUDGET, want=60, floor=10), 10.0)
+    def test_extreme_bitrate_returns_tiny_not_floored(self):
+        # a 10 Gbit stream fits almost nothing; fit_seconds returns the true (tiny) value so
+        # the caller can refuse, rather than forcing a floor that would overflow the RAM disk
+        self.assertLess(fit_seconds(10_000_000_000, self.BUDGET, want=60), 1.0)
 
     def test_unknown_bitrate_defaults_full(self):
         self.assertEqual(fit_seconds(None, self.BUDGET, want=60), 60.0)

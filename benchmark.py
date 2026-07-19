@@ -1323,14 +1323,14 @@ def is_video_file(name):
     return name.lower().endswith(VIDEO_EXTS)
 
 
-def fit_seconds(bitrate_bps, budget_bytes, want=60.0, floor=10.0):
-    """How many seconds of a stream at `bitrate_bps` fit in `budget_bytes` of ramdisk —
-    so a high-bitrate custom file's sample never overflows the RAM disk. Unknown bitrate →
-    keep the full `want`. Never trims below `floor`."""
+def fit_seconds(bitrate_bps, budget_bytes, want=60.0):
+    """How many seconds of a stream at `bitrate_bps` fit in `budget_bytes` of ramdisk — so a
+    high-bitrate custom file's sample never overflows the RAM disk. Unknown bitrate → keep the
+    full `want` (the caller size-checks that case). Returns the true fit, which may be well
+    below `want` for a very high bitrate; the caller refuses when it's too small to be useful."""
     if not bitrate_bps or bitrate_bps <= 0:
         return float(want)
-    max_s = (budget_bytes * 8.0) / bitrate_bps
-    return float(max(floor, min(want, round(max_s, 1))))
+    return float(min(want, round((budget_bytes * 8.0) / bitrate_bps, 1)))
 
 
 def sample_window(duration, want=60.0):
@@ -1788,26 +1788,60 @@ def sample_custom(path):
     global _STAGED
     os.makedirs(RAMDISK, exist_ok=True)
     clear_ramdisk()
+    budget = ramdisk_budget()
+    if budget < 64 * 1024 * 1024:      # nearly-full ramdisk: no room for a usable sample
+        raise RuntimeError("the RAM disk is almost full — free up space and try again")
     m = ffprobe_meta(path)
-    want = fit_seconds(m.get("bitrate"), ramdisk_budget(), want=60.0)
-    start, length = sample_window(m.get("duration"), want=want)
+    size = os.path.getsize(path)
+    dur = m.get("duration")
+    # a stream bitrate is best; fall back to the average from size/duration so an unusually
+    # high-bitrate file is still bounded rather than copied whole
+    br = m.get("bitrate") or (size * 8.0 / dur if dur and dur > 0 else None)
+    # size the window against 60% of the budget: bitrate is an AVERAGE, and a variable-bitrate
+    # window can run well above it, so leave headroom rather than fill the disk to the brim
+    want = fit_seconds(br, int(budget * 0.6), want=60.0)
+    if br and want < 3.0:              # even a few seconds won't fit — too high-bitrate to sample
+        raise RuntimeError("this file's bitrate is too high to sample into the RAM disk")
+    if dur is not None:
+        start, length = sample_window(dur, want=want)
+        if length is None and size > budget:   # "short" file that's still bigger than the disk
+            start, length = 0.0, want          # bound it by time so it can't overflow
+    elif size <= budget:
+        start, length = 0.0, None              # no duration, but the whole file fits anyway
+    else:
+        raise RuntimeError("couldn't read this file's length — it may be damaged")
     cmd = [FFMPEG, "-hide_banner", "-loglevel", "error", "-y"]
     if start > 0:
         cmd += ["-ss", str(start)]              # FAST input seek (before -i): jumps via index
     cmd += ["-i", path, "-map", "0:v:0"]
     if length is not None:
-        cmd += ["-t", str(length)]
+        cmd += ["-t", str(length)]              # bounded by TIME → a valid, playable sample
     cmd += ["-c", "copy", "-an", SOURCE]
     publish(phase="preparing", message="Loading a 60 s sample of your file into RAM…")
-    try:
-        # -c copy is I/O-bound (seconds); a pathological file must not hang prep forever —
-        # a blocked subprocess.run would also make the Cancel button unresponsive.
-        r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
-    except subprocess.TimeoutExpired:
-        raise RuntimeError("sampling timed out — is the file readable/seekable?")
-    except Exception as e:
-        raise RuntimeError(f"sampling failed: {e}")
-    if r.returncode != 0 or not os.path.exists(SOURCE) or os.path.getsize(SOURCE) == 0:
+    # Popen + poll rather than a blocking run: a slow mount or damaged file must stay
+    # cancellable within ~1 s (same pattern as generate_canonical_clip).
+    p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    deadline = time.monotonic() + 120
+    while p.poll() is None:
+        if _ABORT.is_set() or time.monotonic() > deadline:
+            p.kill()
+            p.wait(timeout=10)                  # reap; never leave a zombie or a partial file
+            try:
+                os.remove(SOURCE)
+            except Exception:
+                pass
+            raise RuntimeError("cancelled" if _ABORT.is_set()
+                               else "sampling timed out — is the file readable/seekable?")
+        _ABORT.wait(0.5)
+    # a clean time-bounded copy exits 0; a non-zero code means a real failure (a ramdisk
+    # overflow from an extreme VBR peak beyond the headroom shows up here as ffmpeg's ENOSPC),
+    # and the ffprobe check confirms the staged file is actually readable video.
+    if (p.returncode != 0 or not os.path.exists(SOURCE) or os.path.getsize(SOURCE) == 0
+            or not ffprobe_meta(SOURCE).get("codec")):
+        try:
+            os.remove(SOURCE)
+        except Exception:
+            pass
         raise RuntimeError("could not sample the chosen file")
     return SOURCE
 
