@@ -16,6 +16,8 @@ The second is how fast, which is conversion mode. That's for when you're re-enco
 
 Streaming mode is the one that goes on the leaderboard, because it's the fixed test everyone runs the same way.
 
+Those two modes are the heart of it, but they aren't all it does. You can switch the source and output to different codecs, throw a 4K HDR file at it to see what tone mapping costs your card, or burn subtitles into the picture. You can point it at your own video files instead of the built in clips. And if you've got more than one device, it'll run the whole test across each of them and hand you a comparison table at the end. There's full detail on all of it further down in Beyond the standard test, I just didn't want you scrolling past thinking it only does the one job.
+
 ## Installing it
 
 If you're on Unraid, search Community Apps for Transcoding GPU Benchmark and install it from there. That's the easiest way and it pulls the template in for you.
