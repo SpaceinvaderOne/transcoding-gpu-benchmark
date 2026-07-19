@@ -34,6 +34,8 @@ That's it. The NVIDIA variables are already set in the template, and you'll need
 
 Once it's running, open the WebUI on port `8088` and you'll get the picker screen with every device it found.
 
+![The device picker showing the detected GPUs and CPU with the source and output options](images/picker.png)
+
 ### The first run downloads the test clips
 
 The image itself is small. The actual benchmark clips, which come to about 1.8 GB, download on your first run and get cached in `/config` so they're only ever fetched once. Container updates won't pull them again.
@@ -44,11 +46,17 @@ Every clip is checksummed against a pinned release as it downloads, so everyone 
 
 Pick a device, leave the source and output on their defaults for the standard test, and press start. The scoreboard shows each stream's speed live as it ramps up, and when it finishes you get your headline number along with the power draw and efficiency figures.
 
+![The live scoreboard part way through a run, with several streams going and the worst stream speed above real time](images/live-run.png)
+
+![The finished verdict showing the headline stream count, the power draw and the efficiency figures](images/verdict.png)
+
 The efficiency numbers are where it gets interesting for me. A discrete GPU pulls a lot of power the moment it does anything, so it only looks good per stream when it's running plenty of them. An Intel iGPU sips power by comparison. If you run a CPU baseline as well, you'll see just how much more efficient a media engine is than software encoding for the same job, and that gap was bigger than I'd have guessed. On my own boxes the iGPU came out something like forty times more efficient than the CPU doing the identical work.
 
 ## The leaderboard
 
 Once you've got a streaming result you can submit it to [gpu.spaceinvader.one](https://gpu.spaceinvader.one) with the button on the verdict screen. The board ranks cards by the median of clean runs rather than the single best score anyone managed, so it reflects what you'll typically get, not a lucky one off.
+
+![The leaderboard with the same NVIDIA card listed twice, unlocked and locked, showing the different stream counts](images/leaderboard.png)
 
 A few things it shows that are worth knowing about.
 
