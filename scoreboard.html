@@ -512,11 +512,11 @@ async function tick(){
   // hardware line: vendor chip + GPU name; CPU & RAM for the Intel iGPU; driver
   const hw = document.getElementById("hwline");
   let h = "";
-  if(vendor) h += '<span class="vchip"><span class="dot"></span>'+vendor+'</span>';
-  if(s.selected_name) h += '<b>'+s.selected_name+'</b>';
-  const drvh = drvStr(s); if(drvh) h += ' · drv '+drvh;
-  if(s.is_igpu && s.cpu) h += ' · '+s.cpu;
-  if((s.is_igpu || s.vendor==="cpu") && s.ram_speed) h += ' · RAM '+s.ram_speed+(s.ram_hint?' <span class="warn">('+s.ram_hint+')</span>':'');
+  if(vendor) h += '<span class="vchip"><span class="dot"></span>'+escHtml(vendor)+'</span>';
+  if(s.selected_name) h += '<b>'+escHtml(s.selected_name)+'</b>';
+  const drvh = drvStr(s); if(drvh) h += ' · drv '+escHtml(drvh);
+  if(s.is_igpu && s.cpu) h += ' · '+escHtml(s.cpu);
+  if((s.is_igpu || s.vendor==="cpu") && s.ram_speed) h += ' · RAM '+escHtml(s.ram_speed)+(s.ram_hint?' <span class="warn">('+escHtml(s.ram_hint)+')</span>':'');
   hw.innerHTML = h;
 
   // live estimate tracks measured aggregate throughput
@@ -591,13 +591,17 @@ function teleChip(k,v,accent,title){
          '><div class="tk">'+k+'</div><div class="tv">'+v+'</div></div>';
 }
 // temperature display unit: browser override > server's Unraid dashboard setting > °C.
-// Data is always °C internally — this is presentation only.
-function tempUnit(s){ return localStorage.getItem("tempUnit") || s.temp_unit || "C"; }
+// Data is always °C internally — this is presentation only. localStorage access is wrapped:
+// cookie-blocking browsers THROW on it, and an unguarded throw here killed every render tick.
+function tempUnit(s){
+  let o = null; try{ o = localStorage.getItem("tempUnit"); }catch(e){}
+  return o || s.temp_unit || "C";
+}
 function tempDisplay(c, s){
   return (tempUnit(s)==="F") ? Math.round(c*9/5+32)+"°F" : Math.round(c)+"°C";
 }
 function toggleTempUnit(){
-  localStorage.setItem("tempUnit", tempUnit(LAST)==="F" ? "C" : "F");
+  try{ localStorage.setItem("tempUnit", tempUnit(LAST)==="F" ? "C" : "F"); }catch(e){}
   if(LAST) renderTelemetry(LAST);
 }
 function renderTelemetry(s){
@@ -737,12 +741,22 @@ function renderScreens(s, vendor){
     se.textContent = seMsg; se.className = seMsg ? "show" : "";
   } else if(ui === "error"){
     v.classList.add("show","fail");
+    // clear ALL verdict furniture from any previous run — a stage failure after a finished
+    // convert run used to show the ✕ on top of the old two-panel verdict + efficiency lines
+    document.getElementById("vcap").textContent = "";
+    document.getElementById("vcap").style.display = "";
     document.getElementById("vnum").style.display = "";
     document.getElementById("vnum").textContent = "✕";
     document.getElementById("vdesc").textContent = s.message || "error";
     document.getElementById("vfoot").textContent = "";
     document.getElementById("vspecs").textContent = "";
+    document.getElementById("veff").innerHTML = "";
+    document.getElementById("vinsight").style.display = "none";
+    document.getElementById("convbody").classList.remove("show");
     document.getElementById("submitbtn").style.display = "none";
+    document.getElementById("copybtn").style.display = "none";
+    document.getElementById("pngbtn").style.display = "none";
+    document.getElementById("boardbtn").style.display = "none";
   } else v.classList.remove("show");
   _doneTail(ui);
 }
@@ -759,6 +773,8 @@ function _doneTail(ui){
   }
   // mid-run cancel button: visible only while a run is actually in progress
   const inRun = (ui === "preparing" || ui === "running");
+  if(inRun) BSEL = 0;   // a new run/batch is underway — don't carry the previous batch's
+                        // row selection into the next summary ("first successful" default)
   document.getElementById("cancelrun").classList.toggle("show", inRun);
   if(!inRun) dismissCancel();   // run ended/cancelled — drop any open confirm dialog
 }
@@ -810,16 +826,16 @@ function specLine(s){
   const r = s.result || {}; const bits = [];
   if(r.is_cpu){
     // CPU runs: the levers that actually explain the result — encoder+preset, threads, RAM+XMP
-    bits.push("encoder <b>"+(r.cpu_encoder||"software")+" · "+(r.cpu_preset||"")+"</b>");
-    if(r.cpu) bits.push(r.cpu + (r.cpu_threads?" (<b>"+r.cpu_threads+" threads</b>)":""));
-    if(s.ram_speed) bits.push("RAM <b>"+s.ram_speed+"</b>"+(s.ram_hint?' <span class="warn">('+s.ram_hint+')</span>':''));
+    bits.push("encoder <b>"+escHtml(r.cpu_encoder||"software")+" · "+escHtml(r.cpu_preset||"")+"</b>");
+    if(r.cpu) bits.push(escHtml(r.cpu) + (r.cpu_threads?" (<b>"+escHtml(String(r.cpu_threads))+" threads</b>)":""));
+    if(s.ram_speed) bits.push("RAM <b>"+escHtml(s.ram_speed)+"</b>"+(s.ram_hint?' <span class="warn">('+escHtml(s.ram_hint)+')</span>':''));
   } else {
-    const drv = drvStr(r); if(drv) bits.push("driver <b>"+drv+"</b>");
-    if(s.is_igpu && s.ram_speed) bits.push("RAM <b>"+s.ram_speed+"</b>"+(s.ram_hint?' <span class="warn">('+s.ram_hint+')</span>':''));
-    if(r.cpu) bits.push(r.cpu);
+    const drv = drvStr(r); if(drv) bits.push("driver <b>"+escHtml(drv)+"</b>");
+    if(s.is_igpu && s.ram_speed) bits.push("RAM <b>"+escHtml(s.ram_speed)+"</b>"+(s.ram_hint?' <span class="warn">('+escHtml(s.ram_hint)+')</span>':''));
+    if(r.cpu) bits.push(escHtml(r.cpu));
   }
-  if(r.os_version) bits.push("Unraid <b>"+r.os_version+"</b>");
-  if(r.kernel) bits.push("kernel "+r.kernel);
+  if(r.os_version) bits.push("Unraid <b>"+escHtml(r.os_version)+"</b>");
+  if(r.kernel) bits.push("kernel "+escHtml(r.kernel));
   return bits.join(" · ");
 }
 
@@ -1069,10 +1085,16 @@ function curveSvg(levels, testingN, fastestN){
 function renderConvBody(s, r){
   const sp = r.single_stream||0, comb = r.peak_combined||0, rec = r.rec_workers||1;
   const levels = (r.per_level||[]).slice().sort((a,b)=>a.n-b.n);
+  if(sp <= 0){   // degenerate run — no measurable speed: honest dashes, not "1 hr in ~60 min"
+    document.getElementById("convbody").innerHTML =
+      '<div class="cvcol cvspeed"><div class="cvtitle">Per-file speed</div>'
+      + '<div class="cvbignum">—<span>no measurable speed</span></div></div>';
+    return;
+  }
   const speedup = (sp>0 && comb>0) ? (comb/sp) : 1;   // whole-library speed vs one-at-a-time
   // LEFT panel — per-file speed & time
   const times = [["📺 1 hr show",60],["🎬 1.5 hr movie",90],["🎬 2.5 hr movie",150]]
-    .map(([lbl,mins]) => '<span>'+lbl+' <b>~'+fmtDur(mins/(sp||1))+'</b></span>').join("");
+    .map(([lbl,mins]) => '<span>'+lbl+' <b>~'+fmtDur(mins/sp)+'</b></span>').join("");
   const left =
     '<div class="cvcol cvspeed"><div class="cvtitle">Per-file speed</div>'
     + '<div class="cvbignum">'+fmt(sp)+'×<span>realtime per file</span></div>'
@@ -1219,8 +1241,10 @@ function renderBatch(s){
                         : (b.single_stream||0);
     if(v>bestVal){ bestVal=v; bestIdx=i; }
   });
+  // convert mode has WORKERS, not streams — wps IS Wh per hour of video (same identity as
+  // the verdict's energy line), so label it that way there
   const head = '<div class="bth"><span>Run</span><span>'+(streaming?'Streams':'Per file')
-    +'</span><span>≈W/stream</span><span>Power</span></div>';
+    +'</span><span>'+(streaming?'≈W/stream':'≈Wh/hr video')+'</span><span>Power</span></div>';
   const body = rows.map((b,i)=>{
     if(b.error) return '<div class="btr"><span class="bdev">'+escHtml(b.gpu)
       +(b.profile?' <small>'+escHtml(b.profile)+'</small>':'')
@@ -1363,7 +1387,9 @@ function renderRunDetail(s, r, forBatch){
   const el = id => document.getElementById(id);
   const po = profOfResult(r);
   const name = forBatch ? (r.gpu||"") : (s.selected_name||"");
-  const capped = forBatch ? !!r.capped : (s.cap_reason === "session");
+  // ANY cap kind counts — gating on ==="session" made the memory/unknown wording below
+  // unreachable for live runs (the batch path, driven by r.capped, rendered it correctly)
+  const capped = forBatch ? !!r.capped : !!s.cap_reason;
   const n = forBatch ? (r.max_sustained ?? 0) : (s.confirmed_max ?? 0);
   const projected = forBatch ? r.projected : (s.projected_uncapped ?? r.projected);
   el("veff").innerHTML = effBlock(r);

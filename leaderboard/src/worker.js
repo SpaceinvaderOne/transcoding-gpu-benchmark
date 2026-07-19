@@ -112,6 +112,19 @@ function validate(env0) {
     if (r[k] != null && !capStr(r[k], max)) return "bad " + k;
   if (!Number.isInteger(r.max_sustained) || r.max_sustained < 1 || r.max_sustained > 128)
     return "max_sustained out of range";
+  // display/classification fields: every stored value that later renders or steers the
+  // clean-median / entity / cap-split logic gets a type+range check (defence in depth —
+  // projected in particular renders unescaped-adjacent and MUST be numeric)
+  if (r.capped != null && typeof r.capped !== "boolean") return "bad capped";
+  if (r.projected != null && (!Number.isInteger(r.projected) || r.projected < 1 || r.projected > 10000))
+    return "projected out of range";
+  if (r.limit_reason != null && !["throughput", "session", "memory", "unknown"].includes(r.limit_reason))
+    return "bad limit_reason";
+  if (r.busy_load != null && (!num(r.busy_load) || r.busy_load < 0 || r.busy_load > 100))
+    return "busy_load out of range";
+  if (r.is_igpu != null && typeof r.is_igpu !== "boolean") return "bad is_igpu";
+  for (const k of ["vram_per_session_mb", "vram_total_mb", "vram_free_start_mb", "vram_clean_ceiling"])
+    if (r[k] != null && (!num(r[k]) || r[k] < 0 || r[k] > 10000000)) return k + " out of range";
   if (!num(r.single_stream) || r.single_stream <= 0 || r.single_stream > 100)
     return "single_stream out of range";
   if (!num(r.peak_combined) || r.peak_combined <= 0 || r.peak_combined > 128)
@@ -144,6 +157,10 @@ function validate(env0) {
   }
   if (r.max_sustained < highestDefinite || r.max_sustained > highestPossible)
     return "per_level does not support max_sustained";
+  // a real ramp stops at the FIRST failing level, so every level up to max_sustained passed —
+  // reject curves with a failing level below the claimed max (pass, fail, pass is impossible)
+  for (const L of pl)
+    if (L.n <= r.max_sustained && L.worst < 0.9995) return "per_level not contiguous";
   if (Math.abs(maxCombined - r.peak_combined) > 0.1 * Math.max(maxCombined, r.peak_combined))
     return "peak_combined inconsistent with per_level";
   return null;
@@ -178,9 +195,13 @@ async function handleSubmit(request, env) {
   const ipHash = (await sha256hex(env.RATE_SALT + ip)).slice(0, 32);
   const hourAgo = Math.floor(Date.now() / 1000) - 3600;
   const { results: rl } = await env.DB.prepare(
-    "SELECT COUNT(*) AS c FROM ratelimit WHERE ip_hash = ? AND ts > ?").bind(ipHash, hourAgo).all();
-  if (rl[0].c >= RATE_PER_HOUR)
-    return bad("rate limited", 429, { "Retry-After": "3600" });
+    "SELECT COUNT(*) AS c, MIN(ts) AS oldest FROM ratelimit WHERE ip_hash = ? AND ts > ?")
+    .bind(ipHash, hourAgo).all();
+  if (rl[0].c >= RATE_PER_HOUR) {
+    // sliding window: under-limit again when the oldest in-window row ages out
+    const wait = Math.max(1, (rl[0].oldest ?? hourAgo) - hourAgo);
+    return bad("rate limited", 429, { "Retry-After": String(wait) });
+  }
   const now = Math.floor(Date.now() / 1000);
   await env.DB.prepare("INSERT INTO ratelimit (ip_hash, ts) VALUES (?, ?)").bind(ipHash, now).run();
   // probabilistic cleanup: expired ip-hash rows are useless — don't retain them indefinitely
@@ -348,7 +369,11 @@ async function handleProfiles(env) {
 //   POST /api/admin/restore?id=<n>[&reason=...]  Authorization: Bearer <ADMIN_TOKEN>
 async function handleAdmin(request, url, env, action) {
   const auth = request.headers.get("Authorization") || "";
-  if (!env.ADMIN_TOKEN || auth !== "Bearer " + env.ADMIN_TOKEN) return bad("forbidden", 403);
+  // hash both sides before comparing — a plain !== short-circuits per character, leaking
+  // token-prefix timing (impractical over the network, but free to close)
+  const ok = env.ADMIN_TOKEN
+    && (await sha256hex(auth)) === (await sha256hex("Bearer " + env.ADMIN_TOKEN));
+  if (!ok) return bad("forbidden", 403);
   const id = parseInt(url.searchParams.get("id") || "", 10);
   if (!Number.isInteger(id) || id < 1) return bad("bad id");
   const row = await env.DB.prepare("SELECT id, hidden FROM submissions WHERE id = ?").bind(id).first();
@@ -542,7 +567,7 @@ function runLine(r){
   const lr = r.limit_reason;
   return '<b>'+r.max_sustained+' streams</b>'
     +(lr?'<span class="lbadge '+esc(lr)+'">'+esc(lr==="memory"?"VRAM wall":lr==="session"?"session cap":lr)+'</span>':'')
-    +(r.capped&&r.projected?' · throughput ≈'+r.projected+'×':'')
+    +(r.capped&&r.projected?' · throughput ≈'+esc(String(r.projected))+'×':'')
     +(r.ram?' · '+esc(r.ram):'')+(r.cpu?' · '+esc(r.cpu):'')+(r.driver?' · '+esc(r.driver):'')
     +(r.os_version?' · Unraid '+esc(r.os_version):'')
     +(r.updated_at?' · '+new Date(r.updated_at*1000).toLocaleDateString(undefined,{month:"short",day:"numeric"}):'');
@@ -739,7 +764,7 @@ function renderRows(){
       +(r.count>1&&r.min_streams!==r.best_streams?' <span class="range">('+r.min_streams+'–'+r.best_streams+')</span>':'')
       +(r.understated?'<div class="under">measured under load — may understate</div>':'')
       +(ALLVIEW&&!r.understated&&r.all_count>r.clean_count?'<div class="allline">all runs: median '+r.all_median+' ('+r.all_count+')</div>':'')
-      +(r.mostly_capped?'<div class="cap2">engine throughput ≈'+(r.median_projected||"?")+'× realtime — sessions capped by the driver</div>':'')+'</td>'
+      +(r.mostly_capped?'<div class="cap2">engine throughput ≈'+esc(String(r.median_projected||"?"))+'× realtime — sessions capped by the driver</div>':'')+'</td>'
       +'<td class="num">'+r.best_streams+'</td>'
       +'<td class="num effcell">'+(r.median_wps!=null?r.median_wps:"—")
       +(effMin!=null&&r.median_wps===effMin&&shown.length>1?'<span class="effbadge">⚡ most efficient</span>':'')+'</td>'

@@ -98,6 +98,30 @@ class TestSmbios(unittest.TestCase):
     def test_empty(self):
         self.assertEqual(smbios_mem_speeds(b""), (None, None))
 
+    def _type17_typed(self, mem_type, length=0x22):
+        b = bytearray(length)
+        b[0] = 17
+        b[1] = length
+        b[0x12] = mem_type
+        return bytes(b) + b"\x00\x00"
+
+    def test_mem_type_ddr4_and_ddr5(self):
+        # smbios_mem_type mints the "(DDR4)"/"(DDR5)" leaderboard ENTITY suffix — a silent
+        # regression here would mis-bucket every iGPU/CPU submission on the board
+        end = b"\x7f\x04\x00\x00\x00\x00"
+        self.assertEqual(benchmark.smbios_mem_type(self._type17_typed(0x1A) + end), "DDR4")
+        self.assertEqual(benchmark.smbios_mem_type(self._type17_typed(0x22) + end), "DDR5")
+
+    def test_mem_type_unknown_code_and_empty(self):
+        end = b"\x7f\x04\x00\x00\x00\x00"
+        self.assertIsNone(benchmark.smbios_mem_type(self._type17_typed(0x99) + end))
+        self.assertIsNone(benchmark.smbios_mem_type(b""))
+
+    def test_mem_type_skips_non_17_records(self):
+        end = b"\x7f\x04\x00\x00\x00\x00"
+        other = bytes([4, 0x20]) + bytes(0x1E) + b"\x00\x00"   # a Type 4 (CPU) record first
+        self.assertEqual(benchmark.smbios_mem_type(other + self._type17_typed(0x22) + end), "DDR5")
+
 
 class TestTemp(unittest.TestCase):
     def test_millideg(self):

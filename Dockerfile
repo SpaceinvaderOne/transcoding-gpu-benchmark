@@ -47,7 +47,14 @@ RUN mkdir -p /app/probes \
          -f lavfi -i mandelbrot=size=3840x2160:rate=24 -t 1 -pix_fmt yuv420p10le \
          -c:v libx265 -preset ultrafast -b:v 8M \
          -x265-params "log-level=none:hdr10=1:repeat-headers=1:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1):max-cll=1000,400" \
-         /app/probes/probe_4k_hdr.mkv
+         /app/probes/probe_4k_hdr.mkv \
+    && for p in hevc av1 h264 hdr; do \
+         /usr/lib/jellyfin-ffmpeg/ffprobe -v error -select_streams v:0 \
+           -show_entries stream=codec_name -of csv=p=0 /app/probes/probe_4k_$p.mkv \
+           | grep -qE '^(hevc|av1|h264)$' || exit 1; \
+       done
+# ^ sanity gate: an encoder that exits 0 but emits a truncated/undecodable probe would ship
+#   an image whose boot capability probes silently hide options — fail the BUILD instead
 
 WORKDIR /app
 COPY benchmark.py scoreboard.html burnin.ass /app/

@@ -1091,6 +1091,8 @@ def _download_clip_locked(name, sha, size, part, final, progress_cb, abort_event
                 f.write(chunk)
                 h.update(chunk)
                 done += len(chunk)
+                if done > size:      # oversized stream — stop NOW, don't fill the disk
+                    raise RuntimeError("downloaded clip failed verification (size/hash mismatch)")
                 if progress_cb:
                     progress_cb(done, size)
         if done != size or h.hexdigest() != sha:
@@ -1180,8 +1182,22 @@ def generate_canonical_clip(name, dest):
             "-x264-params", "keyint=240:min-keyint=240"],
     }
     cmd = [FFMPEG, "-y", "-hide_banner", "-loglevel", "error"] + recipes[name] + [dest]
-    r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=3600)
-    if r.returncode != 0 or not os.path.exists(dest):
+    # Popen + poll (not run(timeout=3600)): a blocking run() made Cancel a no-op for up to an
+    # hour on the one path where the wait is minutes — the ≤1–2 s cancel rule applies here too
+    p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    deadline = time.monotonic() + 3600
+    while p.poll() is None:
+        if _ABORT.is_set() or time.monotonic() > deadline:
+            p.kill()
+            p.wait(timeout=10)
+            try:
+                os.remove(dest)
+            except Exception:
+                pass
+            raise RuntimeError("cancelled" if _ABORT.is_set()
+                               else "local clip generation timed out")
+        _ABORT.wait(0.5)
+    if p.returncode != 0 or not os.path.exists(dest):
         raise RuntimeError("local clip generation failed")
     return dest
 
@@ -1518,6 +1534,7 @@ class Stream:
             except Exception:
                 try:
                     p.kill()
+                    p.wait(timeout=5)   # reap — kill() without wait() leaves a zombie
                 except Exception:
                     pass
         with _REG_LOCK:
@@ -1919,21 +1936,29 @@ def run_level(gpu, src, codec, n, last_passing, target_res="1080p", ten_bit=Fals
         _publish_level(n, samp, last_passing, "holding", mode)
 
     means = {sid: (sum(v) / len(v) if v else 0.0) for sid, v in acc.items()}
-    worst = min(means.values()) if means else 0.0
-    combined = sum(means.values())
     mean_power = round(sum(powers) / len(powers), 1) if powers else None
     mean_pkg = round(sum(powers_pkg) / len(powers_pkg), 1) if powers_pkg else None
 
     # LATE death check: a stream still allocating at settle-end can die DURING the hold with
     # zero output — that is a resource ceiling, not a 0.0x throughput failure (validated on the
-    # patched 5090: at N=19 the VRAM-starved stream outlived a short settle, then died)
+    # patched 5090: at N=19 the VRAM-starved stream outlived a short settle, then died).
+    # A stream that produced output and THEN died mid-hold is the same ceiling when its stderr
+    # matches a known resource pattern; otherwise it simply cannot claim the level — samples
+    # only accumulate while alive, so without this its mean would be computed over the living
+    # part and a level with a DEAD stream could pass the "strict worst-stream" rule.
     for s in streams:
-        if (not s.alive()) and s.snapshot()[0] == 0:
-            kind = death_reason(s.err_tail()) or "unrecognised"
+        if s.alive():
+            continue
+        kind = death_reason(s.err_tail())
+        if s.snapshot()[0] == 0 or kind:
+            kind = kind or "unrecognised"
             for t in streams:
                 t.stop()
             return {"worst": 0.0, "combined": 0.0, "cap": True, "cap_kind": kind,
                     "power": None, "power_pkg": None}
+        means[s.id] = 0.0                # died mid-hold, unrecognised cause → level fails
+    worst = min(means.values()) if means else 0.0
+    combined = sum(means.values())
 
     # dGPU VRAM accounting at END of hold — allocations are fully settled here (sampling at
     # hold-START catches sessions mid-allocation at high N and garbles the slope)
@@ -2076,9 +2101,10 @@ def benchmark(gpu, codec="h264", input_codec="hevc", custom_path=None,
     start_telemetry(gpu)
     try:
         # pre-test active-apps check: let telemetry warm up, then see if the GPU is busy
+        # (_ABORT is cleared by start_run/start_batch BEFORE ui="preparing" — clearing it here
+        # swallowed a cancel clicked during the info-gathering window above)
         _CONTINUE.clear()
         _CANCEL.clear()
-        _ABORT.clear()
         time.sleep(2)
         busy, load = gpu_busy(gpu)
         pre_busy_load = load          # travels in the payload — the clean-run predicate's input
@@ -2117,6 +2143,9 @@ def benchmark(gpu, codec="h264", input_codec="hevc", custom_path=None,
         try:
             src = stage_clip(source_res, input_codec, custom_path)
         except Exception as e:
+            if _ABORT.is_set():          # user cancelled mid-download — that's not an error,
+                _publish_cancelled()     # return to the picker like every other abort path
+                return
             publish(ui="error", phase="error", message=f"Could not load the test clip: {e}")
             return
 
@@ -2306,8 +2335,9 @@ def benchmark(gpu, codec="h264", input_codec="hevc", custom_path=None,
 
         ui_kw = {"ui": "done", "phase": "done"} if announce_done else {}
         if mode == "convert":
-            msg = (f"Conversion: {single}× per file, ~{round(peak_combined)}× library throughput, "
-                   f"fastest at ~{rec_workers} parallel.")
+            msg = ((f"Conversion: {single}× per file, ~{round(peak_combined)}× library "
+                    f"throughput, fastest at ~{rec_workers} parallel.")
+                   if single else "Conversion run ended without a measurable speed.")
             publish(confirmed_max=confirmed_max, cap_reason=None,
                     streams_per_watt=spw, power_estimated=power_estimated, result=result,
                     message=msg, **hist_kw, **ui_kw)
@@ -2316,8 +2346,8 @@ def benchmark(gpu, codec="h264", input_codec="hevc", custom_path=None,
                         "memory": "its VRAM ceiling",
                         "unknown": "an unrecognised resource limit"}.get(limit_reason,
                                                                          "a resource limit")
-            msg = (f"Hit {kind_msg} at {confirmed_max} streams — "
-                   f"engine throughput ≈{projected}× realtime.")
+            msg = (f"Hit {kind_msg} at {confirmed_max} streams"
+                   + (f" — engine throughput ≈{projected}× realtime." if projected else "."))
             publish(confirmed_max=confirmed_max,
                     cap_reason=(limit_reason or "session"),
                     projected_uncapped=projected, projected=projected,
@@ -2496,8 +2526,11 @@ def select_custom(name):
         g = _gpu_by_idx(idx)
         if not f or not g:
             return False
-        if (f.get("codec") or "hevc") not in g.get("decodes", ["hevc"]):
-            return False                       # GPU can't hw-decode this file's codec
+        if f.get("codec") not in g.get("decodes", ["hevc"]):
+            return False    # GPU can't hw-decode it — or ffprobe couldn't identify the codec
+                            # (an unidentifiable file can't be decode-gated, so it can't run;
+                            # a permissive default here + a strict one in start_run used to
+                            # silently swap the shipped clip in for the user's file)
         publish(selected_custom=name)
         return True
 
@@ -2529,8 +2562,11 @@ def start_run():
         # a chosen custom file overrides the shipped-clip source (codec + resolution come from it)
         custom_path = None
         f = _custom_by_name(custom_name) if custom_name else None
-        if f and (f.get("codec") or "") in gpu.get("decodes", ["hevc"]):
-            custom_path, input_codec = f["path"], (f.get("codec") or input_codec)
+        if f:
+            if f.get("codec") not in gpu.get("decodes", ["hevc"]):
+                return False    # refuse — never silently run the shipped clip while the UI
+                                # says the user's file was tested
+            custom_path, input_codec = f["path"], f["codec"]
         # safety net: never start a combo the hardware / shipped clips can't actually do
         if source_res not in SOURCE_RES:
             source_res = "4k"
@@ -2547,6 +2583,9 @@ def start_run():
         # auto 10-bit only when preserving resolution from a 10-bit source AND the GPU can do it
         ten_bit = (ten_bit_output(source_res, target_res, input_codec, codec)
                    and codec in gpu.get("codecs10", []) and not custom_path)
+        # clear the abort flag BEFORE ui="preparing" goes out — abort_run() accepts as soon as
+        # the ui flips, so clearing later (inside benchmark()) swallowed early cancels
+        _ABORT.clear()
         publish(ui="preparing", phase="preparing", selected_idx=gpu["idx"],
                 selected_name=gpu["name"], selected_codec=codec, selected_input=input_codec,
                 selected_source_res=source_res, selected_target_res=target_res,
@@ -2597,6 +2636,13 @@ def batch_run(jobs, codec, source_res, target_res, mode):
     rows = []
     try:
         for i, job in enumerate(jobs):
+            # an abort set between jobs (after the previous finalize, before the next clear)
+            # used to be swallowed by benchmark()'s entry clear — catch it here instead
+            if _ABORT.is_set():
+                _publish_cancelled()
+                publish(batch=False, batch_queue=[], batch_done=0, batch_results=[],
+                        batch_skipped=[], submitted=False)
+                return
             label = _job_label(job, codec, source_res, target_res, mode)
             if i > 0 and BATCH_COOLDOWN > 0:
                 publish(message=f"Cooling down {BATCH_COOLDOWN:.0f}s before run "
@@ -2672,6 +2718,7 @@ def start_batch(device_idxs=None, kind="current", codec_override=None, sources=N
         if not jobs:
             return False
         labels = [_job_label(j, codec, source_res, target_res, mode) for j in jobs]
+        _ABORT.clear()      # before ui flips — same early-cancel window as start_run
         publish(ui="preparing", phase="preparing", batch=True,
                 batch_queue=labels, batch_done=0, batch_results=[],
                 batch_skipped=skipped, submitted=False,
@@ -2691,10 +2738,9 @@ def reset_run():
             return False
         stop_all()
         clear_ramdisk()
-        scan = list_custom_files()           # re-scan the drop folder (contents may have changed)
         publish(ui="idle", phase="idle", message="Ready.",
                 source_ready=source_ready(), encoder=None,
-                custom_files=scan["files"], custom_library=scan["library"], selected_custom=None,
+                selected_custom=None,
                 selected_name=None, selected_input="hevc", selected_codec="h264",
                 selected_source_res="4k", selected_target_res="1080p",
                 vendor=None, driver=None,
@@ -2709,7 +2755,11 @@ def reset_run():
                 projected_uncapped=None,
                 history=[], history_delta=None,
                 batch=False, batch_queue=[], batch_done=0, batch_results=[], batch_skipped=[], submitted=False)
-        return True
+    # re-scan the drop folder OUTSIDE the lock — ffprobe over a slow/spun-down network mount
+    # can take minutes, and every POST endpoint waits on RUN_LOCK (the UI froze on Run Again)
+    scan = list_custom_files()
+    publish(custom_files=scan["files"], custom_library=scan["library"])
+    return True
 
 
 def continue_run():
@@ -2801,13 +2851,18 @@ def submit_result():
     with STATE_LOCK:
         result = STATE.get("result")
         already = STATE.get("submitted")
-    if not SUBMIT_URL or not result or already:
-        return False
+        if SUBMIT_URL and result and not already:
+            # mark inside the lock — two rapid /submit posts both saw submitted=False and
+            # both POSTed (the server upsert masked it, but the race is ours to close)
+            STATE["submitted"] = True
+        else:
+            return False
     ok, reason = _post_submission(result)
     if ok:
         publish(submitted=True, message="Submitted to the leaderboard — thank you!")
         return True
-    publish(message=f"Submit rejected: {reason}" if reason else "Submit failed.")
+    publish(submitted=False,
+            message=f"Submit rejected: {reason}" if reason else "Submit failed.")
     return False
 
 
@@ -2822,6 +2877,10 @@ def _submit_batch_thread():
             rows = [dict(r) for r in STATE.get("batch_results", [])]
         sent = 0
         for i, row in enumerate(rows):
+            with STATE_LOCK:
+                if STATE.get("ui") != "done":
+                    return                # /reset mid-flight — stop; don't resurrect the
+                                          # cleared batch rows onto the fresh picker state
             full = row.get("full")
             if not full or not full.get("comparable") or row.get("submitted"):
                 continue
@@ -2832,8 +2891,15 @@ def _submit_batch_thread():
             else:
                 sent += 1
             rows[i] = row
+            with STATE_LOCK:
+                still_done = STATE.get("ui") == "done"
+            if not still_done:
+                return
             publish(batch_results=list(rows))
             time.sleep(1)                 # gentle on the shared rate limit
+        with STATE_LOCK:
+            if STATE.get("ui") != "done":
+                return
         publish(batch_results=rows,
                 message=f"Submitted {sent} result(s) to the leaderboard — thank you!"
                         if sent else "Nothing new to submit.")
@@ -2860,11 +2926,16 @@ def submit_batch():
 TELEMETRY = {}
 TELE_LOCK = threading.Lock()
 _TELE_STOP = threading.Event()
+_TELE_GEN = 0          # bumped by start_telemetry; a sampler from a previous run that was
+                       # mid-sample when the stop flag flipped (nvidia-smi can block ~6 s)
+                       # must not write stale readings into the NEXT run's telemetry
 _RAPL_ACTIVE = False   # RAPL owns power_pkg this run (intel_gpu_top must not fight it)
 
 
-def _tele_set(**kw):
+def _tele_set(gen=None, **kw):
     with TELE_LOCK:
+        if gen is not None and gen != _TELE_GEN:
+            return                     # stale sampler from a previous run — drop the write
         TELEMETRY.update(kw)
         snap = dict(TELEMETRY)
     publish(telemetry=snap)
@@ -2882,7 +2953,7 @@ def telemetry_power_pkg():
         return TELEMETRY.get("power_pkg")
 
 
-def _rapl_telemetry(paths, with_temp=False):
+def _rapl_telemetry(paths, gen, with_temp=False):
     """Vendor-agnostic CPU package power from mounted RAPL counters (Intel + AMD Zen 2+):
     sample energy_uj per package at 1 Hz, sum the deltas → watts → power_pkg. Same field the
     intel_gpu_top path fills, so everything downstream (idle-delta estimate, watts_per_stream,
@@ -2894,7 +2965,7 @@ def _rapl_telemetry(paths, with_temp=False):
             return None
     maxes = {p: _int(_read(os.path.join(p, "max_energy_range_uj"))) for p in paths}
     prev, prev_t = {}, None
-    while not _TELE_STOP.is_set():
+    while not _TELE_STOP.is_set() and gen == _TELE_GEN:
         now = time.monotonic()
         total, ok = 0, False
         for p in paths:
@@ -2910,24 +2981,26 @@ def _rapl_telemetry(paths, with_temp=False):
                 kw = {"power_pkg": w}
                 if with_temp:                      # CPU device on a non-Intel box has no
                     kw["temp"] = read_cpu_package_temp()   # other temp source (k10temp path)
-                _tele_set(**kw)
+                _tele_set(gen, **kw)
         prev_t = now
         _TELE_STOP.wait(1.0)
 
 
-def _nvidia_telemetry(gpu):
+def _nvidia_telemetry(gpu, gen):
     """Full telemetry via `nvidia-smi -q -x`: util, enc/dec %, temp, power, clock, throttle,
     and the process list (stashed under TELEMETRY['_procs'] for the active-apps check)."""
     idx = str(gpu.get("index", 0))
-    while not _TELE_STOP.is_set():
+    while not _TELE_STOP.is_set() and gen == _TELE_GEN:
         try:
             xml = subprocess.run(["nvidia-smi", "-i", idx, "-q", "-x"],
                                  capture_output=True, text=True, timeout=6).stdout
             d = parse_nvidia_xml(xml)
             if d:
                 with TELE_LOCK:
+                    if gen != _TELE_GEN:
+                        break
                     TELEMETRY["_procs"] = d.pop("procs", [])
-                _tele_set(**{k: v for k, v in d.items() if v is not None})
+                _tele_set(gen, **{k: v for k, v in d.items() if v is not None})
         except Exception:
             pass
         _TELE_STOP.wait(1.0)
@@ -3035,14 +3108,14 @@ def gpu_mem_global(gpu):
     return None
 
 
-def _amd_telemetry(gpu):
+def _amd_telemetry(gpu, gen):
     pci = gpu.get("pci")
     busy = f"/sys/class/drm/{os.path.basename(gpu['device'])}/device/gpu_busy_percent"
     hwmon = glob.glob(f"/sys/bus/pci/devices/{pci}/hwmon/*/") if pci else []
     hw = hwmon[0] if hwmon else None
     prev_enc = prev_dec = prev_comp = None
     prev_t = None
-    while not _TELE_STOP.is_set():
+    while not _TELE_STOP.is_set() and gen == _TELE_GEN:
         try:
             util = _f(_read(busy))                            # GFX pipe (kept for the busy gate)
             power = temp = pmax = None
@@ -3072,29 +3145,29 @@ def _amd_telemetry(gpu):
                     if scaler is not None:
                         engines["Video Scaler"] = scaler
             prev_enc, prev_dec, prev_comp, prev_t = e_ns, d_ns, c_ns, now
-            _tele_set(util=util, power=power, power_max=pmax, temp=temp, engines=engines)
+            _tele_set(gen, util=util, power=power, power_max=pmax, temp=temp, engines=engines)
         except Exception:
             pass
         _TELE_STOP.wait(1.0)
 
 
-def _cpu_telemetry(gpu):
+def _cpu_telemetry(gpu, gen):
     """CPU-device sampler: whole-box CPU busy% from /proc/stat deltas at 1 Hz, plus package
     temp. The iGPU engine tiles are meaningless for a software transcode (0% by definition) —
     the load that matters IS the CPU. Package power comes from the RAPL thread when /powercap
     is mounted (it also owns temp then), else the intel_gpu_top power-only fallback."""
     prev = None
-    while not _TELE_STOP.is_set():
+    while not _TELE_STOP.is_set() and gen == _TELE_GEN:
         cur = parse_proc_stat(_read("/proc/stat"))
         kw = {"cpu_load": cpu_stat_pct(prev, cur)}
         prev = cur
         if not _RAPL_ACTIVE:
             kw["temp"] = read_cpu_package_temp()
-        _tele_set(**kw)
+        _tele_set(gen, **kw)
         _TELE_STOP.wait(1.0)
 
 
-def _intel_telemetry(gpu, power_only=False):
+def _intel_telemetry(gpu, gen, power_only=False):
     """Parse intel_gpu_top -J: engine %, frequency, GPU/Package power; temp from CPU package.
     No -d (the slot form is malformed for the shipped build and suppresses all output);
     intel_gpu_top defaults to the Intel GPU, which is what we want. power_only publishes just
@@ -3110,7 +3183,7 @@ def _intel_telemetry(gpu, power_only=False):
         # line-based brace-depth scan (intel_gpu_top -J pretty-prints one token per line);
         # a char-at-a-time Python loop burns measurable CPU on the box being benchmarked.
         for line in p.stdout:
-            if _TELE_STOP.is_set():
+            if _TELE_STOP.is_set() or gen != _TELE_GEN:
                 break
             opens, closes = line.count("{"), line.count("}")
             if opens:
@@ -3136,7 +3209,7 @@ def _intel_telemetry(gpu, power_only=False):
                                            if pw.get("Package") else None)
                     if power_only:
                         kw = {"power_pkg": kw.get("power_pkg")}
-                    _tele_set(**kw)
+                    _tele_set(gen, **kw)
                 except Exception:
                     pass
                 buf, started = [], False
@@ -3145,6 +3218,7 @@ def _intel_telemetry(gpu, power_only=False):
     finally:
         try:
             p.terminate()
+            p.wait(timeout=5)           # reap intel_gpu_top — no zombie per run
         except Exception:
             pass
 
@@ -3214,20 +3288,22 @@ def gpu_busy(gpu):
 def start_telemetry(gpu):
     """Launch the per-vendor telemetry sampler for the GPU under test, plus the vendor-agnostic
     RAPL CPU-power sampler whenever the /powercap mount is present (it then owns power_pkg)."""
-    global _RAPL_ACTIVE
+    global _RAPL_ACTIVE, _TELE_GEN
     _TELE_STOP.clear()
     with TELE_LOCK:
+        _TELE_GEN += 1                 # orphan any sampler still draining from the last run
+        gen = _TELE_GEN
         TELEMETRY.clear()
     rapl = rapl_package_paths()
     _RAPL_ACTIVE = bool(rapl)
     target = {"nvidia": _nvidia_telemetry, "amd": _amd_telemetry,
               "cpu": _cpu_telemetry}.get(gpu["vendor"], _intel_telemetry)
-    threading.Thread(target=target, args=(gpu,), daemon=True).start()
+    threading.Thread(target=target, args=(gpu, gen), daemon=True).start()
     if gpu["vendor"] == "cpu" and not rapl:
         # package-power fallback: Intel box with PERFMON but no /powercap mount
-        threading.Thread(target=_intel_telemetry, args=(gpu, True), daemon=True).start()
+        threading.Thread(target=_intel_telemetry, args=(gpu, gen, True), daemon=True).start()
     if rapl:
-        threading.Thread(target=_rapl_telemetry, args=(rapl, gpu["vendor"] == "cpu"),
+        threading.Thread(target=_rapl_telemetry, args=(rapl, gen, gpu["vendor"] == "cpu"),
                          daemon=True).start()
 
 
@@ -3258,6 +3334,10 @@ def _query_int(path, key):
 
 
 class Handler(BaseHTTPRequestHandler):
+    # idle-socket timeout: without one, a client that connects and sends nothing pins a
+    # daemon thread forever (ThreadingHTTPServer spawns one per connection)
+    timeout = 30
+
     def log_message(self, *a):
         pass
 
@@ -3319,7 +3399,9 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     idxs = [int(x) for x in d.split(",") if x != ""]
                 except ValueError:
-                    idxs = None
+                    # a garbled device list must NOT silently widen to "all devices"
+                    self._send(json.dumps({"ok": False}).encode(), "application/json")
+                    return
             srcs = _query_str(self.path, "srcs")
             ok = start_batch(idxs, _query_str(self.path, "kind") or "current",
                              _query_str(self.path, "codec"),
