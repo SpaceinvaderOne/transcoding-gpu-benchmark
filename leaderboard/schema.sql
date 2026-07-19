@@ -1,5 +1,8 @@
 -- GPU Transcode Benchmark leaderboard (Cloudflare D1 / SQLite)
--- One row per (install_id, gpu, profile); resubmits UPDATE (keep best). Raw envelope kept for audit.
+-- One row per (install_id, gpu, profile, cap_cfg); resubmits UPDATE (keep best). Raw envelope
+-- kept for audit. cap_cfg (1 = driver-session-capped, same formula as the board's entity
+-- split) is part of the IDENTITY: unlocking a driver creates a second row, never overwrites
+-- the capped history.
 CREATE TABLE IF NOT EXISTS submissions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   install_id TEXT NOT NULL,
@@ -24,7 +27,8 @@ CREATE TABLE IF NOT EXISTS submissions (
   updated_at INTEGER,
   ip_hash TEXT,
   raw TEXT,
-  UNIQUE(install_id, gpu, profile)
+  cap_cfg INTEGER NOT NULL DEFAULT 0,
+  UNIQUE(install_id, gpu, profile, cap_cfg)
 );
 CREATE INDEX IF NOT EXISTS idx_sub_profile ON submissions(profile, hidden);
 

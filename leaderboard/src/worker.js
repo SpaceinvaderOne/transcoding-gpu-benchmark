@@ -209,13 +209,20 @@ async function handleSubmit(request, env) {
     await env.DB.prepare("DELETE FROM ratelimit WHERE ts < ?").bind(hourAgo).run();
 
   const r = envelope.result;
-  // upsert: keep the BEST run per (install, gpu, profile); resubmits update, never stack
+  // cap-state is part of the row IDENTITY (same formula as the board's entity split): a
+  // driver-session-capped config and an unlocked one are different hardware realities — an
+  // unlocked resubmission must create a SECOND row, never overwrite the capped history.
+  // (Memory-walled runs are cap_cfg 0 by design: the VRAM ceiling is the card's real limit,
+  // so keep-best against uncapped runs of the same config is legitimate.)
+  const capCfg = (r.capped === true
+                  && (r.limit_reason == null || r.limit_reason === "session")) ? 1 : 0;
+  // upsert: keep the BEST run per (install, gpu, profile, cap-state); resubmits update
   await env.DB.prepare(`
     INSERT INTO submissions (install_id, gpu, vendor, profile, tool_version, max_sustained,
       capped, projected, single_stream, peak_combined, watts_per_stream, power_estimated,
-      driver, os_version, kernel, ram, cpu, submitted_at, updated_at, ip_hash, raw)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-    ON CONFLICT(install_id, gpu, profile) DO UPDATE SET
+      driver, os_version, kernel, ram, cpu, submitted_at, updated_at, ip_hash, raw, cap_cfg)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    ON CONFLICT(install_id, gpu, profile, cap_cfg) DO UPDATE SET
       max_sustained=excluded.max_sustained, capped=excluded.capped, projected=excluded.projected,
       single_stream=excluded.single_stream, peak_combined=excluded.peak_combined,
       watts_per_stream=excluded.watts_per_stream, power_estimated=excluded.power_estimated,
@@ -228,7 +235,7 @@ async function handleSubmit(request, env) {
       r.peak_combined, r.watts_per_stream ?? null, r.power_estimated ? 1 : 0,
       r.driver || null, r.os_version || null, r.kernel || null, r.ram || null, r.cpu || null,
       // server receipt time is authoritative (the client's submitted_at stays in raw only)
-      now, now, ipHash, body).run();
+      now, now, ipHash, body, capCfg).run();
   return json({ ok: true });
 }
 
