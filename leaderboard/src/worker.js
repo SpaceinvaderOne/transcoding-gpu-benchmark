@@ -141,6 +141,12 @@ function validate(env0) {
     return "busy_load out of range";
   if (r.is_igpu != null && typeof r.is_igpu !== "boolean") return "bad is_igpu";
   if (r.nvenc_unlocked != null && typeof r.nvenc_unlocked !== "boolean") return "bad nvenc_unlocked";
+  // the client only records system RAM for an Intel iGPU or a CPU (a discrete GPU uses its own
+  // VRAM, so system RAM is irrelevant and left null). A discrete-GPU submission carrying a RAM
+  // string therefore never came from a real run — it caught a hand-crafted "RTX 4170 / 120
+  // streams / DDR5" forgery, and blocks that whole class cheaply with no false positives.
+  if (r.ram && r.is_igpu !== true && r.is_cpu !== true)
+    return "ram set on a non-iGPU device";
   for (const k of ["vram_per_session_mb", "vram_total_mb", "vram_free_start_mb", "vram_clean_ceiling"])
     if (r[k] != null && (!num(r[k]) || r[k] < 0 || r[k] > 10000000)) return k + " out of range";
   if (!num(r.single_stream) || r.single_stream <= 0 || r.single_stream > 100)
