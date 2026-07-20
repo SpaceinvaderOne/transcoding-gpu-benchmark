@@ -10,6 +10,14 @@ const ACCEPTED_MAJOR = "1";                       // result.tool_version major v
 const CANONICAL = "4K HEVC -> 1080p H264";
 const RATE_PER_HOUR = 30;                         // submissions per ip_hash per hour
 const MAX_BODY = 32 * 1024;
+// A submission is held off the public board for this long after it lands. This breaks a
+// forger's feedback loop (they can't see whether a fake worked and iterate on it in seconds),
+// and it's the window during which the private plausibility check runs. A clean submission
+// publishes automatically once the hold passes; a flagged one waits for review instead.
+const HOLD_SECONDS = 3600;
+// SQL fragment for every PUBLIC read: not hidden, not flagged for review, and past the hold.
+// (`?` binds the hold cutoff = now - HOLD_SECONDS.)
+const PUBLIC_VISIBLE = "hidden = 0 AND flagged = 0 AND updated_at <= ?";
 
 // CORS is PER-ROUTE: public read-only GETs may be embedded anywhere (jsonPub); the submit and
 // admin POSTs get NO CORS headers and NO preflight approval — an arbitrary webpage cannot use
@@ -75,6 +83,19 @@ function nvencVariant(vendor, nvencUnlocked, capped, limitReason) {
   if (nvencUnlocked === false) return "locked";
   const sess = capped && (limitReason == null || limitReason === "session");
   return sess ? "locked" : "unknown";
+}
+
+// Plausibility check. A well-formed submission can still be a fake (the client is public and
+// the JSON is forgeable), so a valid-but-implausible result is HELD for review rather than
+// published automatically. Returns 1 to hold, 0 to let it publish after the normal delay. This
+// never rejects and never touches the client's success response — it only decides auto-publish
+// vs review queue. The exact rules are deliberately NOT in the published source (a forger who
+// can read the rules just satisfies them); this is where the private detection layer lives.
+async function flagCheck(r, env) {
+  // Plausibility rules run privately and are intentionally not published here — a forger
+  // who could read them would simply satisfy them. Deployed builds hold implausible
+  // submissions for review; the public contract above is unchanged.
+  return 0;
 }
 
 function capStr(v, max) { return typeof v === "string" && v.length <= max; }
@@ -238,26 +259,31 @@ async function handleSubmit(request, env) {
   // each other. Non-NVIDIA → "" (single entity). This supersedes the earlier cap_cfg proxy
   // (which keyed on the run OUTCOME) with the actual driver CONFIG variable.
   const hwVariant = nvencVariant(r.vendor, r.nvenc_unlocked, r.capped, r.limit_reason);
+  // private plausibility check (details not published): 0 = looks fine, 1 = hold for review.
+  // Either way the submission is STORED and the client got its success — a flag only affects
+  // whether the row publishes automatically or waits in the review queue.
+  const flagged = await flagCheck(r, env);
   // upsert: keep the BEST run per (install, gpu, profile, hw_variant); resubmits update
   await env.DB.prepare(`
     INSERT INTO submissions (install_id, gpu, vendor, profile, tool_version, max_sustained,
       capped, projected, single_stream, peak_combined, watts_per_stream, power_estimated,
-      driver, os_version, kernel, ram, cpu, submitted_at, updated_at, ip_hash, raw, hw_variant)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+      driver, os_version, kernel, ram, cpu, submitted_at, updated_at, ip_hash, raw, hw_variant, flagged)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     ON CONFLICT(install_id, gpu, profile, hw_variant) DO UPDATE SET
       max_sustained=excluded.max_sustained, capped=excluded.capped, projected=excluded.projected,
       single_stream=excluded.single_stream, peak_combined=excluded.peak_combined,
       watts_per_stream=excluded.watts_per_stream, power_estimated=excluded.power_estimated,
       tool_version=excluded.tool_version, driver=excluded.driver, os_version=excluded.os_version,
       kernel=excluded.kernel, ram=excluded.ram, cpu=excluded.cpu,
-      updated_at=excluded.updated_at, ip_hash=excluded.ip_hash, raw=excluded.raw
+      updated_at=excluded.updated_at, ip_hash=excluded.ip_hash, raw=excluded.raw,
+      flagged=excluded.flagged
     WHERE excluded.max_sustained >= submissions.max_sustained`).bind(
       envelope.install_id, r.gpu, r.vendor || null, r.profile, r.tool_version,
       r.max_sustained, r.capped ? 1 : 0, r.projected ?? null, r.single_stream,
       r.peak_combined, r.watts_per_stream ?? null, r.power_estimated ? 1 : 0,
       r.driver || null, r.os_version || null, r.kernel || null, r.ram || null, r.cpu || null,
       // server receipt time is authoritative (the client's submitted_at stays in raw only)
-      now, now, ipHash, body, hwVariant).run();
+      now, now, ipHash, body, hwVariant, flagged).run();
   return json({ ok: true });
 }
 
@@ -269,6 +295,7 @@ const median = a => {
 
 async function handleTop(url, env) {
   const profile = url.searchParams.get("profile") || CANONICAL;
+  const cutoff = Math.floor(Date.now() / 1000) - HOLD_SECONDS;   // hold new/flagged rows back
   // integrity/clean fields live in the raw envelope — read via json_extract so the CLEAN
   // definition can evolve at query time with no schema migration
   const { results } = await env.DB.prepare(
@@ -279,7 +306,7 @@ async function handleTop(url, env) {
             json_extract(raw,'$.result.is_igpu') AS is_igpu,
             hw_variant,
             json_extract(raw,'$.result.limit_reason') AS limit_reason
-     FROM submissions WHERE profile = ? AND hidden = 0`).bind(profile).all();
+     FROM submissions WHERE profile = ? AND ${PUBLIC_VISIBLE}`).bind(profile, cutoff).all();
 
   // CLEAN = low pre-run engine load AND (when VRAM fields exist) low baseline VRAM.
   // Free VRAM alone is not an idle card; missing fields (pre-integrity rows) = not clean.
@@ -358,17 +385,18 @@ async function handleDetail(url, env) {
   if (!gpu) return bad("missing gpu");
   // ?profiles=1 — the "your GPU across all boards" strip: which profiles does this card
   // appear on, and with how many runs (allowlisted aggregate only, like everything here)
+  const cutoff = Math.floor(Date.now() / 1000) - HOLD_SECONDS;   // hold new/flagged rows back
   if (url.searchParams.get("profiles") === "1") {
     const { results } = await env.DB.prepare(
       `SELECT profile, COUNT(*) AS count FROM submissions
-       WHERE gpu = ? AND hidden = 0 GROUP BY profile ORDER BY count DESC`).bind(gpu).all();
+       WHERE gpu = ? AND ${PUBLIC_VISIBLE} GROUP BY profile ORDER BY count DESC`).bind(gpu, cutoff).all();
     return jsonPub({ gpu, profiles: results });
   }
   const profile = url.searchParams.get("profile") || CANONICAL;
   const gen = url.searchParams.get("gen");         // iGPU entity filter (DDR4/DDR5/unknown)
   const hw = url.searchParams.get("hw");           // NVIDIA lock-state entity filter
-  let where = "profile = ? AND gpu = ? AND hidden = 0";
-  const binds = [profile, gpu];
+  let where = "profile = ? AND gpu = ? AND " + PUBLIC_VISIBLE;
+  const binds = [profile, gpu, cutoff];
   if (gen === "RAM unknown") where += " AND ram IS NULL";
   else if (gen) where += " AND ram LIKE '" + gen.replace(/[^A-Z0-9]/gi, "") + "%'";
   if (hw != null) {
@@ -399,9 +427,10 @@ async function handleDetail(url, env) {
 
 async function handleProfiles(env) {
   // which streaming boards exist (source→output codec pairs) + how many runs each
+  const cutoff = Math.floor(Date.now() / 1000) - HOLD_SECONDS;
   const { results } = await env.DB.prepare(
-    `SELECT profile, COUNT(*) AS count FROM submissions WHERE hidden = 0
-     GROUP BY profile ORDER BY count DESC`).all();
+    `SELECT profile, COUNT(*) AS count FROM submissions WHERE ${PUBLIC_VISIBLE}
+     GROUP BY profile ORDER BY count DESC`).bind(cutoff).all();
   // canonical always listed (and first) even before it has submissions
   if (!results.some(r => r.profile === CANONICAL)) results.unshift({ profile: CANONICAL, count: 0 });
   else results.sort((a, b) => (a.profile === CANONICAL ? -1 : b.profile === CANONICAL ? 1 : b.count - a.count));
@@ -409,27 +438,47 @@ async function handleProfiles(env) {
 }
 
 // Admin moderation: token in the Authorization header (NEVER a query string — URLs leak into
-// histories/logs), integer-validated id, 404 on missing, every action audited, restorable.
-//   POST /api/admin/hide?id=<n>[&reason=...]     Authorization: Bearer <ADMIN_TOKEN>
-//   POST /api/admin/restore?id=<n>[&reason=...]  Authorization: Bearer <ADMIN_TOKEN>
+// histories/logs), integer-validated id, 404 on missing, every action audited.
+//   POST /api/admin/hide?id=<n>[&reason=...]      Authorization: Bearer <ADMIN_TOKEN>  (hidden=1)
+//   POST /api/admin/restore?id=<n>[&reason=...]   Authorization: Bearer <ADMIN_TOKEN>  (hidden=0)
+//   POST /api/admin/approve?id=<n>[&reason=...]   clears a review flag so the row publishes
 async function handleAdmin(request, url, env, action) {
-  const auth = request.headers.get("Authorization") || "";
-  // hash both sides before comparing — a plain !== short-circuits per character, leaking
-  // token-prefix timing (impractical over the network, but free to close)
-  const ok = env.ADMIN_TOKEN
-    && (await sha256hex(auth)) === (await sha256hex("Bearer " + env.ADMIN_TOKEN));
-  if (!ok) return bad("forbidden", 403);
+  if (!(await adminOk(request, env))) return bad("forbidden", 403);
   const id = parseInt(url.searchParams.get("id") || "", 10);
   if (!Number.isInteger(id) || id < 1) return bad("bad id");
-  const row = await env.DB.prepare("SELECT id, hidden FROM submissions WHERE id = ?").bind(id).first();
+  const row = await env.DB.prepare("SELECT id FROM submissions WHERE id = ?").bind(id).first();
   if (!row) return bad("not found", 404);
-  const hidden = action === "hide" ? 1 : 0;
-  await env.DB.prepare("UPDATE submissions SET hidden = ? WHERE id = ?").bind(hidden, id).run();
+  if (action === "approve")
+    await env.DB.prepare("UPDATE submissions SET flagged = 0 WHERE id = ?").bind(id).run();
+  else
+    await env.DB.prepare("UPDATE submissions SET hidden = ? WHERE id = ?")
+      .bind(action === "hide" ? 1 : 0, id).run();
   const reason = (url.searchParams.get("reason") || "").slice(0, 200) || null;
   await env.DB.prepare(
     "INSERT INTO moderation_actions (submission_id, action, reason, created_at) VALUES (?,?,?,?)")
     .bind(id, action, reason, Math.floor(Date.now() / 1000)).run();
   return json({ ok: true, id, action });
+}
+
+async function adminOk(request, env) {
+  const auth = request.headers.get("Authorization") || "";
+  return !!env.ADMIN_TOKEN
+    && (await sha256hex(auth)) === (await sha256hex("Bearer " + env.ADMIN_TOKEN));
+}
+
+// The review queue: every submission the plausibility check held back, with the fields a human
+// or an agent needs to judge it (never install_id / ip_hash / raw). Bearer-auth, read-only.
+//   GET /api/admin/queue    Authorization: Bearer <ADMIN_TOKEN>
+async function handleQueue(request, env) {
+  if (!(await adminOk(request, env))) return bad("forbidden", 403);
+  const { results } = await env.DB.prepare(
+    `SELECT id, gpu, vendor, profile, max_sustained, single_stream, peak_combined,
+            watts_per_stream, ram, cpu, driver, hw_variant, updated_at,
+            json_extract(raw,'$.result.nvenc_unlocked') AS nvenc_unlocked,
+            json_extract(raw,'$.result.limit_reason') AS limit_reason,
+            json_extract(raw,'$.result.per_level') AS per_level
+     FROM submissions WHERE flagged = 1 AND hidden = 0 ORDER BY updated_at DESC LIMIT 200`).all();
+  return json({ ok: true, count: results.length, queue: results });
 }
 
 // ---- the public page ---------------------------------------------------------------------------
@@ -870,8 +919,10 @@ export default {
     if (p === "/api/top" && request.method === "GET") return handleTop(url, env);
     if (p === "/api/detail" && request.method === "GET") return handleDetail(url, env);
     if (p === "/api/profiles" && request.method === "GET") return handleProfiles(env);
+    if (p === "/api/admin/queue" && request.method === "GET") return handleQueue(request, env);
     if (p === "/api/admin/hide" && request.method === "POST") return handleAdmin(request, url, env, "hide");
     if (p === "/api/admin/restore" && request.method === "POST") return handleAdmin(request, url, env, "restore");
+    if (p === "/api/admin/approve" && request.method === "POST") return handleAdmin(request, url, env, "approve");
     if (p === "/" || p === "/index.html")
       return new Response(PAGE, { headers: { "Content-Type": "text/html; charset=utf-8",
         "Cache-Control": "no-store",

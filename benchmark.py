@@ -2960,7 +2960,8 @@ def submit_result():
             return False
     ok, reason = _post_submission(result)
     if ok:
-        publish(submitted=True, message="Submitted to the leaderboard — thank you!")
+        publish(submitted=True,
+                message="Submitted — thank you! New results appear on the leaderboard within about an hour.")
         return True
     publish(submitted=False,
             message=f"Submit rejected: {reason}" if reason else "Submit failed.")
@@ -3002,8 +3003,8 @@ def _submit_batch_thread():
             if STATE.get("ui") != "done":
                 return
         publish(batch_results=rows,
-                message=f"Submitted {sent} result(s) to the leaderboard — thank you!"
-                        if sent else "Nothing new to submit.")
+                message=(f"Submitted {sent} result(s) — thank you! They appear on the "
+                         f"leaderboard within about an hour." if sent else "Nothing new to submit."))
     finally:
         _SUBMITTING_BATCH.clear()
 
