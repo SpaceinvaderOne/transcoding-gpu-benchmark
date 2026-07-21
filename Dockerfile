@@ -70,7 +70,7 @@ ENV FFMPEG_BIN=/usr/lib/jellyfin-ffmpeg/ffmpeg \
     SOURCE_BITRATE=50M \
     SOURCE_DURATION=60 \
     MAX_STREAMS=128 \
-    UNRAID_VER_FILE=/unraid-version \
+    OS_VER_FILE=/os-release \
     DMI_TABLE=/dmi/DMI
 
 # NVIDIA: harmless without the runtime; NVIDIA users add `--runtime=nvidia` so these

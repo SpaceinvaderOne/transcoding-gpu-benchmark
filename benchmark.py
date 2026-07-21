@@ -85,7 +85,7 @@ CPU_PRESETS     = {"streaming": _env("CPU_PRESET_STREAM", "veryfast"),   # Plex/
 CPU_ENCODERS    = {"h264": "libx264", "hevc": "libx265", "av1": "libsvtav1"}
 SAMPLE_INTERVAL = float(_env("SAMPLE_INTERVAL", "1.0"))
 DMI_TABLE       = _env("DMI_TABLE", "/dmi/DMI")   # raw SMBIOS table (optional RO mount)
-UNRAID_VER_FILE = _env("UNRAID_VER_FILE", "/unraid-version")  # optional RO mount
+OS_VER_FILE = _env("OS_VER_FILE", "/os-release")  # optional RO mount
 DYNAMIX_CFG     = _env("DYNAMIX_CFG", "/dynamix.cfg")  # optional RO mount of Unraid's
                                                        # dynamix.cfg (temperature unit)
 # leaderboard endpoint — hardcoded by policy (changed only by shipping a new image version);
@@ -572,24 +572,14 @@ def kernel_version():
         return None
 
 
-def parse_os_version(txt):
-    """Pull the OS version out of an /etc/unraid-version-style file. Handles Unraid's numeric
-    version="7.3.2" AND non-numeric ones from other OSes the container runs on — e.g. MOS
-    reports version="MOS 0.5.0". The old regex anchored the value to a leading digit, so a
-    non-numeric version fell through and dumped the whole raw line (version="MOS 0.5.0" instead
-    of MOS 0.5.0). Returns the value inside version="...", or a bare version=..., capped to a
-    sane length; None when there's nothing usable."""
-    t = txt or ""
-    m = re.search(r'version="([^"]+)"', t) or re.search(r'version=([^\s"]+)', t)
-    return ((m.group(1) if m else t).strip())[:60] or None
-
-
-def unraid_version():
-    """Read the OS version from an optional RO-mounted version file (Unraid's
-    /etc/unraid-version, or another OS's equivalent like MOS)."""
+def os_version():
+    """Read the OS version from an optional RO-mounted version file (/etc/os-release)."""
     try:
-        with open(UNRAID_VER_FILE) as f:
-            return parse_os_version(f.read())
+        with open("/os-release") as f:
+            for line in f:
+                if line.startswith("PRETTY_NAME="):
+                    return line.partition("=")[2].strip().strip('"')
+        return None
     except Exception:
         return None
 
@@ -2164,7 +2154,7 @@ def _build_result(gpu, codec, confirmed_max, single, peak_combined, per_level,
         "idle_power_w": idle_w, "one_stream_power_w": one_w, "load_power_w": load_w,
         "peak_power_w": eff_power, "power_insight": insight, "temp_c": tele.get("temp"),
         "cpu": cpu_model(), "ram": STATE.get("ram_speed"), "ram_type": STATE.get("ram_type"),
-        "kernel": kernel_version(), "os_version": unraid_version(),
+        "kernel": kernel_version(), "os_version": os_version(),
     }
     return result, spw, power_estimated
 
@@ -2194,7 +2184,7 @@ def benchmark(gpu, codec="h264", input_codec="hevc", custom_path=None,
             "selected_codec": codec, "selected_input": input_codec,
             "selected_source_res": source_res, "selected_target_res": target_res,
             "selected_mode": mode,
-            "kernel": kernel_version(), "os_version": unraid_version(),
+            "kernel": kernel_version(), "os_version": os_version(),
             "cpu": None, "ram_speed": None, "ram_type": None, "ram_hint": None,
             "streams_per_watt": None, "result": None}
     # RAM speed/XMP matter whenever the transcode runs through SYSTEM memory: the iGPU (shares

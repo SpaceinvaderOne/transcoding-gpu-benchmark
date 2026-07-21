@@ -841,7 +841,7 @@ function specLine(s){
     if(s.is_igpu && s.ram_speed) bits.push("RAM <b>"+escHtml(s.ram_speed)+"</b>"+(s.ram_hint?' <span class="warn">('+escHtml(s.ram_hint)+')</span>':''));
     if(r.cpu) bits.push(escHtml(r.cpu));
   }
-  if(r.os_version) bits.push("Unraid <b>"+escHtml(r.os_version)+"</b>");
+  if(r.os_version) bits.push("OS <b>"+escHtml(r.os_version)+"</b>");
   if(r.kernel) bits.push("kernel "+escHtml(r.kernel));
   return bits.join(" · ");
 }
@@ -1378,7 +1378,7 @@ function specLineR(r){
     if(r.ram) bits.push("RAM <b>"+escHtml(r.ram)+"</b>");
     if(r.cpu) bits.push(escHtml(r.cpu));
   }
-  if(r.os_version) bits.push("Unraid <b>"+escHtml(r.os_version)+"</b>");
+  if(r.os_version) bits.push("OS <b>"+escHtml(r.os_version)+"</b>");
   if(r.kernel) bits.push("kernel "+escHtml(r.kernel));
   return bits.join(" · ");
 }
@@ -1469,7 +1469,7 @@ function resultText(){
     "Single-stream "+fmt(r.single_stream)+"× · peak combined "+fmt(r.peak_combined)+"×"+(eff?(" · "+eff):""),
     (r.power_insight||""),
     "Driver "+(drvStr(r)||"?")+(r.ram?(" · RAM "+r.ram):"")+(r.cpu?(" · "+r.cpu):""),
-    (r.os_version?("Unraid "+r.os_version+" · "):"")+"kernel "+(r.kernel||"?"),
+    (r.os_version?("OS "+r.os_version+" · "):"")+"kernel "+(r.kernel||"?"),
   ].filter(Boolean).join("\n");
 }
 async function copyResult(){
@@ -1541,7 +1541,7 @@ function downloadCard(){
   // footer specs
   x.fillStyle="#7b8aa0"; x.font="18px Segoe UI,sans-serif";
   x.fillText("driver "+(drvStr(r)||"?")+(r.ram?("   RAM "+r.ram):"")+
-    (r.os_version?("   Unraid "+r.os_version):""), 40, Math.min(y, H-24));
+    (r.os_version?("   OS "+r.os_version):""), 40, Math.min(y, H-24));
   const a=document.createElement("a");
   a.href=c.toDataURL("image/png"); a.download=(r.gpu.replace(/[^a-z0-9]+/gi,"_"))+"_benchmark.png"; a.click();
 }

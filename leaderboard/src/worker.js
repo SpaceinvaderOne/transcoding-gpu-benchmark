@@ -665,7 +665,7 @@ function runLine(r){
     +(lr?'<span class="lbadge '+esc(lr)+'">'+esc(lr==="memory"?"VRAM wall":lr==="session"?"session cap":lr)+'</span>':'')
     +(r.capped&&r.projected?' · throughput ≈'+esc(String(r.projected))+'×':'')
     +(r.ram?' · '+esc(r.ram):'')+(r.cpu?' · '+esc(r.cpu):'')+(r.driver?' · '+esc(r.driver):'')
-    +(r.os_version?' · Unraid '+esc(r.os_version):'')
+    +(r.os_version?' · OS '+esc(r.os_version):'')
     +(r.updated_at?' · '+new Date(r.updated_at*1000).toLocaleDateString(undefined,{month:"short",day:"numeric"}):'');
 }
 function detailHtml(d){
