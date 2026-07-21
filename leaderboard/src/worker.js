@@ -492,7 +492,8 @@ body{background:radial-gradient(1000px 700px at 50% 0%,#10243b 0%,#06101c 70%);c
 .wrap{max-width:860px;margin:0 auto;text-align:center}
 .cap{color:var(--muted);font-size:15px;letter-spacing:4px;text-transform:uppercase}
 h1{font-size:44px;font-weight:900;letter-spacing:-1px;margin:6px 0 4px}
-.sub{color:var(--muted);margin-bottom:28px}.sub b{color:var(--ink)}
+.sub{color:var(--muted);margin-bottom:10px}.sub b{color:var(--ink)}
+.notice{color:var(--muted);font-size:13px;margin-bottom:24px;opacity:.85}
 table{width:100%;border-collapse:collapse;background:#0e1521;border:1px solid #25405d;border-radius:14px;overflow:hidden}
 th{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);padding:12px 14px;text-align:left;border-bottom:1px solid #1a2738}
 td{padding:12px 14px;text-align:left;border-bottom:1px solid #141d2c;font-size:15px}
@@ -569,6 +570,7 @@ td.effcell{color:var(--green)}
 </style></head><body><div class="wrap">
 <div class="cap">Transcoding GPU Benchmark</div><h1>Leaderboard</h1>
 <div class="sub" id="sub">Simultaneous <b>4K HEVC → 1080p H.264 (8M)</b> streams at ≥ 1.0× realtime · median of community submissions · click a row for the breakdown</div>
+<div class="notice">New results go live within about an hour. Anything that doesn't look right is held for a quick manual check first.</div>
 <div class="pillrows" id="pillrows" style="display:none">
   <div class="prow"><span class="plab">Source</span><span class="pset" id="srcs"></span></div>
   <div class="prow"><span class="plab">Output</span><span class="pset" id="outs"></span></div>
