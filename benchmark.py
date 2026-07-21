@@ -572,13 +572,24 @@ def kernel_version():
         return None
 
 
+def parse_os_version(txt):
+    """Pull the OS version out of an /etc/unraid-version-style file. Handles Unraid's numeric
+    version="7.3.2" AND non-numeric ones from other OSes the container runs on — e.g. MOS
+    reports version="MOS 0.5.0". The old regex anchored the value to a leading digit, so a
+    non-numeric version fell through and dumped the whole raw line (version="MOS 0.5.0" instead
+    of MOS 0.5.0). Returns the value inside version="...", or a bare version=..., capped to a
+    sane length; None when there's nothing usable."""
+    t = txt or ""
+    m = re.search(r'version="([^"]+)"', t) or re.search(r'version=([^\s"]+)', t)
+    return ((m.group(1) if m else t).strip())[:60] or None
+
+
 def unraid_version():
-    """Read the Unraid OS version from an optional RO-mounted /etc/unraid-version."""
+    """Read the OS version from an optional RO-mounted version file (Unraid's
+    /etc/unraid-version, or another OS's equivalent like MOS)."""
     try:
         with open(UNRAID_VER_FILE) as f:
-            txt = f.read()
-        m = re.search(r'version="?([0-9][^"\s]*)"?', txt)
-        return m.group(1) if m else (txt.strip() or None)
+            return parse_os_version(f.read())
     except Exception:
         return None
 

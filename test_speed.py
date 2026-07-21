@@ -879,6 +879,26 @@ class TestDisplayUnit(unittest.TestCase):
         self.assertEqual(benchmark.parse_display_unit('unit="X"\n'), "C")
 
 
+class TestOsVersion(unittest.TestCase):
+    """The OS-version reader must handle non-Unraid version strings cleanly — a MOS host
+    reported version="MOS 0.5.0" and the old digit-anchored regex dumped the whole raw line."""
+    def test_unraid_numeric(self):
+        self.assertEqual(benchmark.parse_os_version('version="7.3.2"\n'), "7.3.2")
+
+    def test_non_numeric_os(self):
+        self.assertEqual(benchmark.parse_os_version('version="MOS 0.5.0"'), "MOS 0.5.0")
+
+    def test_unquoted(self):
+        self.assertEqual(benchmark.parse_os_version('version=7.0.1'), "7.0.1")
+
+    def test_empty_or_none(self):
+        self.assertIsNone(benchmark.parse_os_version(""))
+        self.assertIsNone(benchmark.parse_os_version(None))
+
+    def test_capped_to_sane_length(self):
+        self.assertLessEqual(len(benchmark.parse_os_version('version="' + "x" * 200 + '"')), 60)
+
+
 class TestHdrTonemap(unittest.TestCase):
     """HDR is a pseudo input codec: transcode_cmd grows a tone-map stage per vendor (chains
     validated live on real hardware incl. the -stream_loop seam). Output is always SDR 8-bit."""
