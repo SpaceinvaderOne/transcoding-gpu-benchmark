@@ -27,6 +27,7 @@
   #verdict .specs .warn{color:var(--amber)}
   #suberr{display:none;margin-top:12px;font-size:14px;color:var(--red);font-weight:600}
   #suberr.show{display:block}
+  #suberr.ok{color:var(--green)}
   .vchip{display:inline-flex;align-items:center;gap:7px;font-size:12px;font-weight:700;
     letter-spacing:1.5px;text-transform:uppercase;color:var(--accent);
     border:1px solid var(--accent);border-radius:999px;padding:3px 11px}
@@ -736,9 +737,15 @@ function renderScreens(s, vendor){
     bb.style.display = (s.submitted && s.board_url) ? "" : "none";
     if(s.board_url) bb.href = s.board_url;
     renderRunDetail(s, r, false);
+    // submit status line under the buttons: the "goes live in ~1 h" note on success (this used
+    // to only land in the hidden live status line), or the rejection reason on failure
     const se = document.getElementById("suberr");
-    const seMsg = /^Submit (failed|rejected)/.test(s.message||"") ? s.message : "";
-    se.textContent = seMsg; se.className = seMsg ? "show" : "";
+    if(s.submitted){
+      se.textContent = "✓ Submitted — new results appear on the leaderboard within about an hour.";
+      se.className = "show ok";
+    } else if(/^Submit (failed|rejected)/.test(s.message||"")){
+      se.textContent = s.message; se.className = "show";
+    } else { se.textContent = ""; se.className = ""; }
   } else if(ui === "error"){
     v.classList.add("show","fail");
     // clear ALL verdict furniture from any previous run — a stage failure after a finished
