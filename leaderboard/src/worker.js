@@ -493,7 +493,7 @@ body{background:radial-gradient(1000px 700px at 50% 0%,#10243b 0%,#06101c 70%);c
 .cap{color:var(--muted);font-size:15px;letter-spacing:4px;text-transform:uppercase}
 h1{font-size:44px;font-weight:900;letter-spacing:-1px;margin:6px 0 4px}
 .sub{color:var(--muted);margin-bottom:14px}.sub b{color:var(--ink)}
-.notice{display:inline-block;color:var(--ink);font-size:14px;margin:0 auto 26px;
+.notice{display:inline-block;color:var(--ink);font-size:14px;margin:14px auto 18px;
   background:rgba(74,163,255,.10);border:1px solid rgba(74,163,255,.35);border-radius:10px;padding:9px 16px}
 .notice b{font-weight:700}
 table{width:100%;border-collapse:collapse;background:#0e1521;border:1px solid #25405d;border-radius:14px;overflow:hidden}
@@ -571,8 +571,8 @@ td.effcell{color:var(--green)}
 .showall button:hover{border-color:var(--accent)}
 </style></head><body><div class="wrap">
 <div class="cap">Transcoding GPU Benchmark</div><h1>Leaderboard</h1>
-<div class="sub" id="sub">Simultaneous <b>4K HEVC → 1080p H.264 (8M)</b> streams at ≥ 1.0× realtime · median of community submissions · click a row for the breakdown</div>
 <div class="notice">New results go live <b>within about an hour</b>. Anything that doesn't look right is held for a quick manual check first.</div>
+<div class="sub" id="sub">Simultaneous <b>4K HEVC → 1080p H.264 (8M)</b> streams at ≥ 1.0× realtime · median of community submissions · click a row for the breakdown</div>
 <div class="pillrows" id="pillrows" style="display:none">
   <div class="prow"><span class="plab">Source</span><span class="pset" id="srcs"></span></div>
   <div class="prow"><span class="plab">Output</span><span class="pset" id="outs"></span></div>
