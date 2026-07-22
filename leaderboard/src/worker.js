@@ -15,9 +15,9 @@ const MAX_BODY = 32 * 1024;
 // and it's the window during which the private plausibility check runs. A clean submission
 // publishes automatically once the hold passes; a flagged one waits for review instead.
 const HOLD_SECONDS = 3600;
-// SQL fragment for every PUBLIC read: not hidden, not flagged for review, and past the hold.
-// (`?` binds the hold cutoff = now - HOLD_SECONDS.)
-const PUBLIC_VISIBLE = "hidden = 0 AND flagged = 0 AND updated_at <= ?";
+// SQL fragment for every PUBLIC read: not hidden, not flagged for review, and either past the
+// hold or explicitly published early by an admin. (`?` binds the cutoff = now - HOLD_SECONDS.)
+const PUBLIC_VISIBLE = "hidden = 0 AND flagged = 0 AND (publish_now = 1 OR updated_at <= ?)";
 
 // CORS is PER-ROUTE: public read-only GETs may be embedded anywhere (jsonPub); the submit and
 // admin POSTs get NO CORS headers and NO preflight approval — an arbitrary webpage cannot use
@@ -448,8 +448,10 @@ async function handleAdmin(request, url, env, action) {
   if (!Number.isInteger(id) || id < 1) return bad("bad id");
   const row = await env.DB.prepare("SELECT id FROM submissions WHERE id = ?").bind(id).first();
   if (!row) return bad("not found", 404);
-  if (action === "approve")
-    await env.DB.prepare("UPDATE submissions SET flagged = 0 WHERE id = ?").bind(id).run();
+  if (action === "approve")   // human-verified: clear the flag AND skip any remaining hold
+    await env.DB.prepare("UPDATE submissions SET flagged = 0, publish_now = 1 WHERE id = ?").bind(id).run();
+  else if (action === "publish")   // override the publication hold on a clean row
+    await env.DB.prepare("UPDATE submissions SET publish_now = 1 WHERE id = ?").bind(id).run();
   else
     await env.DB.prepare("UPDATE submissions SET hidden = ? WHERE id = ?")
       .bind(action === "hide" ? 1 : 0, id).run();
@@ -469,16 +471,32 @@ async function adminOk(request, env) {
 // The review queue: every submission the plausibility check held back, with the fields a human
 // or an agent needs to judge it (never install_id / ip_hash / raw). Bearer-auth, read-only.
 //   GET /api/admin/queue    Authorization: Bearer <ADMIN_TOKEN>
+const ADMIN_ROW_FIELDS = `id, gpu, vendor, profile, max_sustained, single_stream, peak_combined,
+            watts_per_stream, ram, cpu, driver, os_version, hw_variant, updated_at,
+            json_extract(raw,'$.result.nvenc_unlocked') AS nvenc_unlocked,
+            json_extract(raw,'$.result.limit_reason') AS limit_reason,
+            json_extract(raw,'$.result.per_level') AS per_level`;
+
 async function handleQueue(request, env) {
   if (!(await adminOk(request, env))) return bad("forbidden", 403);
   const { results } = await env.DB.prepare(
-    `SELECT id, gpu, vendor, profile, max_sustained, single_stream, peak_combined,
-            watts_per_stream, ram, cpu, driver, hw_variant, updated_at,
-            json_extract(raw,'$.result.nvenc_unlocked') AS nvenc_unlocked,
-            json_extract(raw,'$.result.limit_reason') AS limit_reason,
-            json_extract(raw,'$.result.per_level') AS per_level
+    `SELECT ${ADMIN_ROW_FIELDS}
      FROM submissions WHERE flagged = 1 AND hidden = 0 ORDER BY updated_at DESC LIMIT 200`).all();
   return json({ ok: true, count: results.length, queue: results });
+}
+
+// Clean submissions still inside the publication hold — the "goes live soon" list, so an admin
+// can eyeball one and push it live early. Same allowlisted fields as the review queue.
+//   GET /api/admin/pending    Authorization: Bearer <ADMIN_TOKEN>
+async function handlePending(request, env) {
+  if (!(await adminOk(request, env))) return bad("forbidden", 403);
+  const cutoff = Math.floor(Date.now() / 1000) - HOLD_SECONDS;
+  const { results } = await env.DB.prepare(
+    `SELECT ${ADMIN_ROW_FIELDS}
+     FROM submissions WHERE flagged = 0 AND hidden = 0 AND publish_now = 0 AND updated_at > ?
+     ORDER BY updated_at DESC LIMIT 200`).bind(cutoff).all();
+  return json({ ok: true, count: results.length, pending: results,
+                live_in: results.map(r => Math.max(0, r.updated_at - cutoff)) });
 }
 
 // ---- the public page ---------------------------------------------------------------------------
@@ -911,6 +929,114 @@ fetch("/api/profiles").then(r=>r.json()).then(d=>{
 });
 </script></body></html>`;
 
+// ---- the admin console (served at /admin) ------------------------------------------------------
+// A shell page: it holds NO data and can render nothing without the ADMIN_TOKEN, which the
+// admin pastes once (kept in localStorage) and which every fetch sends as a Bearer header.
+// Recommended second layer: Cloudflare Access on the /admin path.
+const ADMIN_PAGE = `<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex">
+<title>Benchmark admin</title><style>
+:root{--bg:#0a0e14;--ink:#e8eef7;--muted:#7b8aa0;--accent:#4aa3ff;--green:#2ecc71;--red:#e74c3c;--amber:#f1c40f}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:radial-gradient(1000px 700px at 50% 0%,#10243b 0%,#06101c 70%);color:var(--ink);
+  font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;min-height:100vh;padding:34px 16px}
+.wrap{max-width:900px;margin:0 auto}
+.cap{color:var(--muted);font-size:13px;letter-spacing:4px;text-transform:uppercase;text-align:center}
+h1{font-size:32px;font-weight:900;text-align:center;margin:4px 0 22px}
+h2{font-size:15px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin:26px 0 10px}
+.card{background:#0e1521;border:1px solid #25405d;border-radius:12px;padding:14px 16px;margin-bottom:10px}
+.card .gpu{font-weight:800;font-size:16px}
+.card .meta{color:var(--muted);font-size:13px;margin:2px 0 6px}
+.card .curve{font-family:ui-monospace,Menlo,monospace;font-size:12px;color:var(--muted);word-break:break-all}
+.row{display:flex;justify-content:space-between;align-items:flex-start;gap:14px;flex-wrap:wrap}
+.btns{display:flex;gap:8px;flex-shrink:0}
+button{border:0;border-radius:8px;padding:8px 14px;font-weight:700;font-size:13px;cursor:pointer;color:#08131f}
+.ok{background:var(--green)}.no{background:var(--red);color:#fff}.pub{background:var(--accent)}
+.ghost{background:transparent;color:var(--muted);border:1px solid #25405d}
+.empty{color:var(--muted);padding:14px 2px}
+.livein{color:var(--amber);font-size:12px;font-weight:700}
+#tokbox{max-width:520px;margin:40px auto;text-align:center}
+#tok{width:100%;padding:10px 12px;border-radius:8px;border:1px solid #25405d;background:#0e1521;color:var(--ink);margin:10px 0}
+.note{color:var(--muted);font-size:13px}
+#msg{text-align:center;color:var(--amber);min-height:22px;margin-bottom:6px}
+.topbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:4px}
+a{color:var(--accent)}
+</style></head><body><div class="wrap">
+<div class="cap">Transcoding GPU Benchmark</div><h1>Admin</h1>
+<div id="tokbox" style="display:none">
+  <div>Paste the admin token to unlock this console.</div>
+  <input id="tok" type="password" placeholder="admin token" autocomplete="off">
+  <button class="pub" onclick="saveTok()">Unlock</button>
+  <div class="note" style="margin-top:10px">The token is kept only in this browser. Every action is checked server-side.</div>
+</div>
+<div id="main" style="display:none">
+  <div class="topbar"><div class="note">All actions are audited.</div>
+    <div class="btns"><button class="ghost" onclick="refresh()">Refresh</button>
+    <button class="ghost" onclick="dropTok()">Lock</button></div></div>
+  <div id="msg"></div>
+  <h2>Held for review</h2><div id="qlist"></div>
+  <h2>Awaiting publication (within the hold window)</h2><div id="plist"></div>
+</div>
+<script>
+function tok(){ try{ return localStorage.getItem("adminTok")||""; }catch(e){ return ""; } }
+function saveTok(){ try{ localStorage.setItem("adminTok", document.getElementById("tok").value.trim()); }catch(e){}
+  gate(); refresh(); }
+function dropTok(){ try{ localStorage.removeItem("adminTok"); }catch(e){} gate(); }
+function gate(){ const has=!!tok();
+  document.getElementById("tokbox").style.display=has?"none":"";
+  document.getElementById("main").style.display=has?"":"none"; }
+async function api(path, opts){
+  const r = await fetch(path, Object.assign({headers:{Authorization:"Bearer "+tok()}}, opts||{}));
+  if(r.status===403){ dropTok(); throw new Error("bad token"); }
+  return r.json();
+}
+function esc(s){ return String(s==null?"":s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+function curveTxt(pl){
+  try{ const a=JSON.parse(pl||"[]"); return a.map(l=>l.worst).join(" \\u2192 "); }catch(e){ return ""; }
+}
+function metaTxt(r){
+  const bits=[];
+  bits.push("max "+r.max_sustained+" \\u00b7 single "+r.single_stream+"\\u00d7 \\u00b7 peak "+r.peak_combined+"\\u00d7");
+  if(r.watts_per_stream!=null) bits.push(r.watts_per_stream+" W/stream");
+  if(r.ram) bits.push(esc(r.ram)); if(r.driver) bits.push("drv "+esc(r.driver));
+  if(r.os_version) bits.push("OS "+esc(r.os_version));
+  if(r.limit_reason) bits.push("stopped: "+esc(r.limit_reason));
+  if(r.hw_variant) bits.push(esc(r.hw_variant));
+  return bits.join(" \\u00b7 ");
+}
+function card(r, btns, extra){
+  return '<div class="card"><div class="row"><div>'
+    +'<div class="gpu">'+esc(r.gpu)+' <span class="note">\\u00b7 '+esc(r.profile)+'</span></div>'
+    +'<div class="meta">'+metaTxt(r)+(extra?(' \\u00b7 <span class="livein">'+extra+'</span>'):'')+'</div>'
+    +'<div class="curve">'+esc(curveTxt(r.per_level))+'</div></div>'
+    +'<div class="btns">'+btns+'</div></div></div>';
+}
+async function refresh(){
+  if(!tok()) return;
+  const msg=document.getElementById("msg"); msg.textContent="";
+  try{
+    const q = await api("/api/admin/queue");
+    document.getElementById("qlist").innerHTML = q.queue.length ? q.queue.map(r=>
+      card(r, '<button class="ok" onclick="act(\\u0027approve\\u0027,'+r.id+')">Approve</button>'
+            +'<button class="no" onclick="act(\\u0027hide\\u0027,'+r.id+')">Reject</button>')).join("")
+      : '<div class="empty">Nothing held for review.</div>';
+    const p = await api("/api/admin/pending");
+    document.getElementById("plist").innerHTML = p.pending.length ? p.pending.map((r,i)=>
+      card(r, '<button class="pub" onclick="act(\\u0027publish\\u0027,'+r.id+')">Publish now</button>',
+        "live in ~"+Math.ceil((p.live_in[i]||0)/60)+" min")).join("")
+      : '<div class="empty">Nothing waiting \\u2014 all published.</div>';
+  }catch(e){ msg.textContent = e.message==="bad token" ? "Token rejected \\u2014 paste it again." : "Could not load: "+e.message; }
+}
+async function act(action, id){
+  const msg=document.getElementById("msg");
+  try{ const r = await api("/api/admin/"+action+"?id="+id, {method:"POST"});
+    msg.textContent = r.ok ? (action+" \\u2713") : ("failed: "+(r.error||"unknown")); }
+  catch(e){ msg.textContent = "failed: "+e.message; }
+  refresh();
+}
+gate(); refresh(); setInterval(refresh, 60000);
+</script></div></body></html>`;
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -924,9 +1050,19 @@ export default {
     if (p === "/api/detail" && request.method === "GET") return handleDetail(url, env);
     if (p === "/api/profiles" && request.method === "GET") return handleProfiles(env);
     if (p === "/api/admin/queue" && request.method === "GET") return handleQueue(request, env);
+    if (p === "/api/admin/pending" && request.method === "GET") return handlePending(request, env);
     if (p === "/api/admin/hide" && request.method === "POST") return handleAdmin(request, url, env, "hide");
     if (p === "/api/admin/restore" && request.method === "POST") return handleAdmin(request, url, env, "restore");
     if (p === "/api/admin/approve" && request.method === "POST") return handleAdmin(request, url, env, "approve");
+    if (p === "/api/admin/publish" && request.method === "POST") return handleAdmin(request, url, env, "publish");
+    if (p === "/admin" && request.method === "GET")
+      return new Response(ADMIN_PAGE, { headers: { "Content-Type": "text/html; charset=utf-8",
+        "Cache-Control": "no-store", "X-Robots-Tag": "noindex",
+        // page is a shell: every data call needs the Bearer token, so serving the HTML is safe.
+        // Putting Cloudflare Access in front of /admin adds a second, edge-level gate.
+        "Content-Security-Policy": "default-src 'none'; script-src 'unsafe-inline'; " +
+          "style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'",
+        "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer" } });
     if (p === "/" || p === "/index.html")
       return new Response(PAGE, { headers: { "Content-Type": "text/html; charset=utf-8",
         "Cache-Control": "no-store",

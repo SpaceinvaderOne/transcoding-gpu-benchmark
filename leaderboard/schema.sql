@@ -31,6 +31,9 @@ CREATE TABLE IF NOT EXISTS submissions (
   -- flagged = 1 → held for review by the plausibility check; it does not publish automatically
   -- when the hold window passes. Public reads require hidden = 0 AND flagged = 0.
   flagged INTEGER NOT NULL DEFAULT 0,
+  -- publish_now = 1 → an admin overrode the publication hold (or approved a flagged row), so
+  -- the row shows immediately instead of waiting out the hold window.
+  publish_now INTEGER NOT NULL DEFAULT 0,
   UNIQUE(install_id, gpu, profile, hw_variant)
 );
 CREATE INDEX IF NOT EXISTS idx_sub_profile ON submissions(profile, hidden);
