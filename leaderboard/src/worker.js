@@ -1055,7 +1055,7 @@ export default {
     if (p === "/api/admin/restore" && request.method === "POST") return handleAdmin(request, url, env, "restore");
     if (p === "/api/admin/approve" && request.method === "POST") return handleAdmin(request, url, env, "approve");
     if (p === "/api/admin/publish" && request.method === "POST") return handleAdmin(request, url, env, "publish");
-    if (p === "/admin" && request.method === "GET")
+    if ((p === "/admin" || p === "/admin/") && request.method === "GET")
       return new Response(ADMIN_PAGE, { headers: { "Content-Type": "text/html; charset=utf-8",
         "Cache-Control": "no-store", "X-Robots-Tag": "noindex",
         // page is a shell: every data call needs the Bearer token, so serving the HTML is safe.
