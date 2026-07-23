@@ -293,6 +293,30 @@ const median = a => {
                                   : (s[s.length / 2 - 1] + s[s.length / 2]) / 2) : null;
 };
 
+// dGPU VRAM capacity as a board identity axis (like iGPU RAM generation). Snap the reported
+// megabytes to the nearest real board size: an "8 GB" card reads ~7.6 GB, a "20 GB" card ~19.
+// Buckets ARE the ladder rungs, so an 8 GB and a 16 GB variant never merge, and 10 vs 12 GB stay
+// distinct. Below 3.5 GB = an APU carve-out / no discrete VRAM → null (those rows stay unlabelled
+// rather than getting a nonsense "· 2 GB"; a few genuine 2 GB discretes go unlabelled too, an
+// acceptable trade against mislabelling every APU). A single install = one physical card, so
+// variants come from different machines and never collide on the storage key — this is display only.
+const VRAM_LADDER = [4, 5, 6, 8, 10, 12, 16, 20, 24, 32, 40, 48, 64, 80, 96, 128];
+function vramBucket(mb) {
+  if (mb == null) return null;
+  const gb = mb / 1024;
+  if (gb < 3.5) return null;
+  return VRAM_LADDER.reduce((best, s) => Math.abs(gb - s) < Math.abs(gb - best) ? s : best, VRAM_LADDER[0]);
+}
+// [loMB, hiMB) that snap to bucket n — the midpoints to the neighbouring rungs, so the drill-down
+// filter matches vramBucket() exactly.
+function vramBounds(n) {
+  const i = VRAM_LADDER.indexOf(n);
+  if (i < 0) return null;
+  const lo = i === 0 ? 3.5 : (VRAM_LADDER[i - 1] + n) / 2;
+  const hi = i === VRAM_LADDER.length - 1 ? 1e12 : (n + VRAM_LADDER[i + 1]) / 2;
+  return [lo * 1024, hi * 1024];
+}
+
 async function handleTop(url, env) {
   const profile = url.searchParams.get("profile") || CANONICAL;
   const cutoff = Math.floor(Date.now() / 1000) - HOLD_SECONDS;   // hold new/flagged rows back
@@ -327,13 +351,18 @@ async function handleTop(url, env) {
   for (const row of results) {
     const igpu = row.is_igpu === 1 || row.is_igpu === true || row.ram != null;
     const gen = igpu ? (ramGen(row.ram) || "RAM unknown") : null;
-    const entity = gen ? row.gpu + " (" + gen + ")" : row.gpu;
+    // dGPU VRAM capacity splits variants of the same card (8 GB vs 16 GB), the same way RAM
+    // generation splits an iGPU. Shown inline "· 16 GB" like the "(DDR5)" tag.
+    const vram = igpu ? null : vramBucket(row.vt);
+    const entity = gen ? row.gpu + " (" + gen + ")"
+                 : vram ? row.gpu + " · " + vram + " GB"
+                 : row.gpu;
     const variant = row.hw_variant != null && row.hw_variant !== ""
       ? row.hw_variant
       : nvencVariant(row.vendor, null, row.capped, row.limit_reason);   // legacy backfill
     const sess = row.capped && (row.limit_reason == null || row.limit_reason === "session");
     const k = entity + "|" + variant;
-    if (!byKey.has(k)) byKey.set(k, { entity, base_gpu: row.gpu, ram_gen: gen,
+    if (!byKey.has(k)) byKey.set(k, { entity, base_gpu: row.gpu, ram_gen: gen, vram_gb: vram,
       vendor: row.vendor, nvenc: variant, sessCount: 0, rows: [] });
     const g = byKey.get(k);
     if (sess) g.sessCount++;
@@ -357,7 +386,7 @@ async function handleTop(url, env) {
     const shown = clean || all;                 // no clean runs ⇒ mark-and-show the loaded stats
     const cappedMost = g.sessCount * 2 >= g.rows.length;   // majority session-capped
     return {
-      gpu: g.entity, base_gpu: g.base_gpu, ram_gen: g.ram_gen, vendor: g.vendor,
+      gpu: g.entity, base_gpu: g.base_gpu, ram_gen: g.ram_gen, vram_gb: g.vram_gb, vendor: g.vendor,
       nvenc: g.nvenc,                            // ""|locked|unlocked|unknown → board badge
       session_capped: cappedMost,
       mostly_capped: cappedMost,
@@ -410,6 +439,15 @@ async function handleDetail(url, env) {
              + " (capped = 1 AND COALESCE(json_extract(raw,'$.result.limit_reason'),'session') = 'session')))";
     else { where += " AND hw_variant = ?"; binds.push(hw); }
   }
+  const vram = url.searchParams.get("vram");        // dGPU VRAM-capacity entity filter (8/16/…)
+  if (vram) {
+    const b = vramBounds(parseInt(vram, 10));
+    if (b) {
+      where += " AND CAST(json_extract(raw,'$.result.vram_total_mb') AS REAL) >= ?"
+             + " AND CAST(json_extract(raw,'$.result.vram_total_mb') AS REAL) < ?";
+      binds.push(b[0], b[1]);
+    }
+  }
   const { results: dist } = await env.DB.prepare(
     `SELECT ram, max_sustained AS streams, COUNT(*) AS count
      FROM submissions WHERE ${where} GROUP BY ram, max_sustained`).bind(...binds).all();
@@ -422,7 +460,29 @@ async function handleDetail(url, env) {
   const { results: recent } = await env.DB.prepare(
     `SELECT ${fields} FROM submissions WHERE ${where}
      ORDER BY updated_at DESC LIMIT 10`).bind(...binds).all();
-  return jsonPub({ gpu, profile, dist, top, recent });
+  // VRAM economics (dGPU only): per-stream cost, measured ceiling, and WHY it stopped — all
+  // measured, no projection across capacities we have not seen.
+  const { results: vr } = await env.DB.prepare(
+    `SELECT CAST(json_extract(raw,'$.result.vram_per_session_mb') AS REAL) AS vps,
+            CAST(json_extract(raw,'$.result.vram_clean_ceiling') AS REAL) AS ceil,
+            json_extract(raw,'$.result.limit_reason') AS lr, max_sustained AS ms
+     FROM submissions WHERE ${where}`).bind(...binds).all();
+  return jsonPub({ gpu, profile, dist, top, recent, vram: vramEcon(vr) });
+}
+
+function vramEcon(rows) {
+  const vps = rows.map(r => r.vps).filter(v => v != null && v > 0);
+  if (!vps.length) return null;                       // iGPU/CPU or no VRAM instrumentation
+  const ceils = rows.map(r => r.ceil).filter(v => v != null && v > 0);
+  const tally = {};
+  for (const r of rows) if (r.lr) tally[r.lr] = (tally[r.lr] || 0) + 1;
+  const reason = Object.keys(tally).sort((a, b) => tally[b] - tally[a])[0] || null;
+  return {
+    per_stream_mb: Math.round(median(vps)),
+    ceiling: ceils.length ? Math.round(median(ceils)) : null,
+    reason,                                           // memory | throughput | session | unknown
+    best: Math.max(...rows.map(r => r.ms)),
+  };
 }
 
 async function handleProfiles(env) {
@@ -509,6 +569,7 @@ body{background:radial-gradient(1000px 700px at 50% 0%,#10243b 0%,#06101c 70%);c
   font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;min-height:100vh;padding:40px 16px}
 .wrap{max-width:860px;margin:0 auto;text-align:center}
 .cap{color:var(--muted);font-size:15px;letter-spacing:4px;text-transform:uppercase}
+.stat{color:var(--muted);font-size:15.5px;margin-top:12px}.stat b{color:var(--ink);font-weight:800}
 h1{font-size:44px;font-weight:900;letter-spacing:-1px;margin:6px 0 4px}
 .sub{color:var(--muted);margin-bottom:14px}.sub b{color:var(--ink)}
 .notice{display:inline-block;color:var(--ink);font-size:14px;margin:14px auto 18px;
@@ -539,6 +600,7 @@ tr.detail>td{background:#0a111d;padding:18px 22px}
 .legend i{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:5px}
 .barinfo{margin-top:8px;font-size:12.5px;color:#cdd9e8;background:#111b2b;border:1px solid #1e3048;border-radius:8px;padding:8px 12px;line-height:1.45}
 .punch{margin-top:10px;font-size:13.5px;font-weight:700;color:var(--green);line-height:1.4}
+.vramline{color:var(--ink);font-size:13.5px;line-height:1.45;margin:0 0 12px;padding:9px 13px;background:rgba(74,163,255,.08);border:1px solid rgba(74,163,255,.28);border-radius:9px}
 .ccount{color:var(--muted);font-size:12px}
 .prov{color:#f1c40f;font-size:11px;letter-spacing:.05em;text-transform:uppercase;margin-left:6px}
 .under{color:#f1c40f;font-size:12.5px;margin-top:3px}
@@ -589,6 +651,7 @@ td.effcell{color:var(--green)}
 .showall button:hover{border-color:var(--accent)}
 </style></head><body><div class="wrap">
 <div class="cap">Transcoding GPU Benchmark</div><h1>Leaderboard</h1>
+<div class="stat" id="stat"></div>
 <div class="notice">New results go live <b>within about an hour</b>. Anything that doesn't look right is held for a quick manual check first.</div>
 <div class="sub" id="sub">Simultaneous <b>4K HEVC → 1080p H.264 (8M)</b> streams at ≥ 1.0× realtime · median of community submissions · click a row for the breakdown</div>
 <div class="pillrows" id="pillrows" style="display:none">
@@ -695,6 +758,21 @@ function runLine(r){
     +(r.os_version?' · '+esc(osLabel(r.os_version)):'')
     +(r.updated_at?' · '+new Date(r.updated_at*1000).toLocaleDateString(undefined,{month:"short",day:"numeric"}):'');
 }
+function vramLine(v){
+  if(!v||!v.per_stream_mb) return "";
+  const gb=(v.per_stream_mb/1024).toFixed(1);
+  const wall=v.ceiling||v.best;
+  let msg;
+  if(v.reason==="memory")
+    msg='Each stream needs about '+gb+' GB of video memory, and this card runs out of VRAM around '+wall+' streams. A larger-capacity version of the same card would go further.';
+  else if(v.reason==="session")
+    msg='Each stream needs about '+gb+' GB of video memory, but this card is held back by its driver session cap at '+v.best+', not memory, so more VRAM would not add streams here.';
+  else if(v.reason==="throughput")
+    msg='Each stream needs about '+gb+' GB of video memory, but this card runs out of encoder throughput at '+v.best+', not memory, so more VRAM would not add streams here.';
+  else
+    msg='Each stream needs about '+gb+' GB of video memory on this card.';
+  return '<div class="vramline">'+esc(msg)+'</div>';
+}
 function detailHtml(d){
   const dist=d.dist||[];
   if(!dist.length) return '<div class="dhead">No runs</div>';
@@ -718,7 +796,8 @@ function detailHtml(d){
   }
   const top=(d.top||[]).map((r,i)=>'<div class="runrow">'+["①","②","③"][i]+' '+runLine(r)+'</div>').join("");
   const recent=(d.recent||[]).map(r=>'<div class="runrow">'+runLine(r)+'</div>').join("");
-  return '<div class="dwrap">'
+  return (d.vram?vramLine(d.vram):'')
+    +'<div class="dwrap">'
     +'<div class="dcol"><div class="dhead">Distribution — '+total+' submission'+(total>1?'s':'')
       +' (median marked'+(total>1?' · click a bar for its RAM makeup':'')+')</div>'
       +histogram(dist,med)+'</div>'
@@ -742,7 +821,7 @@ function lockBadge(v){
   if(v==="locked")   return '<span class="lock lok" title="Stock driver — the NVIDIA NVENC concurrent-session limit is in place">🔒 locked</span>';
   return "";
 }
-async function toggle(tr, gpu, gen, hw){
+async function toggle(tr, gpu, gen, hw, vram){
   const open=tr.classList.contains("open");
   document.querySelectorAll("tr.detail").forEach(e=>e.remove());
   document.querySelectorAll("tr.open").forEach(e=>e.classList.remove("open"));
@@ -754,7 +833,7 @@ async function toggle(tr, gpu, gen, hw){
   try{
     const d=await (await fetch("/api/detail?gpu="+encodeURIComponent(gpu)
       +"&profile="+encodeURIComponent(PROFILE)+(gen?("&gen="+encodeURIComponent(gen)):"")
-      +(hw?("&hw="+encodeURIComponent(hw)):""))).json();
+      +(hw?("&hw="+encodeURIComponent(hw)):"")+(vram?("&vram="+encodeURIComponent(vram)):""))).json();
     det.firstChild.innerHTML=detailHtml(d);
   }catch(e){ det.firstChild.textContent="Could not load details."; }
 }
@@ -887,7 +966,7 @@ function renderRows(){
   for(const r of shown) if(r.median_wps!=null&&(effMin==null||r.median_wps<effMin)) effMin=r.median_wps;
   tb.innerHTML=shown.map((r,i)=>{
     const cnt = r.understated ? (r.count+' run'+(r.count>1?'s':'')) : (r.clean_count+' clean run'+(r.clean_count>1?'s':''));
-    return '<tr class="gpurow'+(i===0?' top':'')+'" data-gpu="'+esc(r.base_gpu)+'" data-gen="'+esc(r.ram_gen||"")+'" data-hw="'+esc(r.nvenc||"")+'"><td class="rank">'+(i+1)+'</td>'
+    return '<tr class="gpurow'+(i===0?' top':'')+'" data-gpu="'+esc(r.base_gpu)+'" data-gen="'+esc(r.ram_gen||"")+'" data-hw="'+esc(r.nvenc||"")+'" data-vram="'+esc(String(r.vram_gb||""))+'"><td class="rank">'+(i+1)+'</td>'
       +'<td class="gpu"><span class="chev">▸</span>'+esc(r.gpu)+lockBadge(r.nvenc)+'<div class="v">'+esc(r.vendor||"")+'</div></td>'
       +'<td class="num"><span class="big">'+r.median_streams+'</span>'
       +' <span class="ccount">('+cnt+')'+(r.provisional?' <span class="prov">provisional</span>':'')+'</span>'
@@ -900,7 +979,7 @@ function renderRows(){
       +(effMin!=null&&r.median_wps===effMin&&shown.length>1?'<span class="effbadge">⚡ most efficient</span>':'')+'</td>'
       +'<td class="num">'+r.count+'</td></tr>';
   }).join("");
-  tb.querySelectorAll("tr.gpurow").forEach(tr=>tr.addEventListener("click",()=>toggle(tr,tr.dataset.gpu,tr.dataset.gen,tr.dataset.hw)));
+  tb.querySelectorAll("tr.gpurow").forEach(tr=>tr.addEventListener("click",()=>toggle(tr,tr.dataset.gpu,tr.dataset.gen,tr.dataset.hw,tr.dataset.vram)));
   const sa=document.getElementById("showall");
   if(!filtered&&!SHOWALL&&rows.length>TOPN){
     sa.style.display="";
@@ -920,6 +999,9 @@ document.querySelectorAll("th.sortable").forEach(th=>th.addEventListener("click"
 document.getElementById("q").addEventListener("input",e=>{Q=e.target.value.trim();SHOWALL=false;renderRows();});
 renderChips();
 fetch("/api/profiles").then(r=>r.json()).then(d=>{
+  const total=(d.profiles||[]).reduce((a,p)=>a+(p.count||0),0);
+  const st=document.getElementById("stat");
+  if(st&&total>0) st.innerHTML='<b>'+total.toLocaleString()+'</b> results and counting';
   PROFILES=(d.profiles||[]).map(p=>{
     const ps=parseProf(p.profile);
     return ps?{profile:p.profile,count:p.count||0,src:ps.src,out:ps.out,subs:ps.subs}:null;
