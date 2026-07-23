@@ -86,13 +86,15 @@ CPU_ENCODERS    = {"h264": "libx264", "hevc": "libx265", "av1": "libsvtav1"}
 SAMPLE_INTERVAL = float(_env("SAMPLE_INTERVAL", "1.0"))
 DMI_TABLE       = _env("DMI_TABLE", "/dmi/DMI")   # raw SMBIOS table (optional RO mount)
 UNRAID_VER_FILE = _env("UNRAID_VER_FILE", "/unraid-version")  # optional RO mount
+OS_VER_FILE     = _env("OS_VER_FILE", "/os-release")  # optional RO mount of the HOST's /etc/os-release
+                                                      # (non-Unraid fallback; NOT the container's own)
 DYNAMIX_CFG     = _env("DYNAMIX_CFG", "/dynamix.cfg")  # optional RO mount of Unraid's
                                                        # dynamix.cfg (temperature unit)
 # leaderboard endpoint — hardcoded by policy (changed only by shipping a new image version);
 # will move to gpu.spaceinvader.one once the domain's DNS is on Cloudflare. Setting the env var
 # to empty/whitespace disables submission entirely (the Submit button never shows).
 SUBMIT_URL      = _env("SUBMIT_URL", "https://gpu.spaceinvader.one/api/submit").strip()
-TOOL_VERSION    = "1.2"
+TOOL_VERSION    = "1.3"
 
 # SMBIOS Memory Device "Memory Type" enum (subset)
 MEM_TYPE = {0x13: "DDR", 0x14: "DDR2", 0x18: "DDR3", 0x1A: "DDR4", 0x1E: "LPDDR",
@@ -584,12 +586,36 @@ def parse_os_version(txt):
     return ((m.group(1) if m else t).strip())[:60] or None
 
 
-def unraid_version():
-    """Read the OS version from an optional RO-mounted version file (Unraid's
-    /etc/unraid-version, or another OS's equivalent like MOS)."""
+def parse_os_release(txt):
+    """Pull a human OS name out of an /etc/os-release file: PRETTY_NAME without a trailing
+    CPU-arch suffix (e.g. "Ubuntu 22.04.3 LTS", "Debian GNU/Linux 12 (bookworm)"). Unraid's
+    own PRETTY_NAME is "Unraid OS 7.3 x86_64" -> "Unraid OS 7.3", but Unraid is read from the
+    version file first so we only reach here on non-Unraid hosts. Capped to a sane length;
+    None when there's no PRETTY_NAME."""
+    m = re.search(r'^PRETTY_NAME="?([^"\n]+)"?', txt or "", re.M)
+    if not m:
+        return None
+    v = re.sub(r'\s+(x86_64|amd64|aarch64|arm64|i[0-9]86)$', '', m.group(1).strip())
+    return v[:60] or None
+
+
+def os_version():
+    """Resolve the HOST OS version, most specific source first:
+      1. /unraid-version (Unraid and Unraid-family builds like MOS ship this) -> precise version;
+      2. /os-release PRETTY_NAME (any other Linux, via the docker-compose mount) -> distro name;
+    both are OPTIONAL RO mounts of the HOST's files (never the container's own /etc/os-release,
+    which is the jellyfin-ffmpeg Debian base). None when neither is mounted. The value is stored
+    RAW; the board decides whether to prefix "Unraid" (see osLabel in worker.js)."""
     try:
         with open(UNRAID_VER_FILE) as f:
-            return parse_os_version(f.read())
+            v = parse_os_version(f.read())
+            if v:
+                return v
+    except Exception:
+        pass
+    try:
+        with open(OS_VER_FILE) as f:
+            return parse_os_release(f.read())
     except Exception:
         return None
 
@@ -1364,25 +1390,38 @@ def probe_clip(codec):
     return full if os.path.exists(full) else None
 
 
+def decode_probe_cmd(gpu, master):
+    """Build the ffmpeg argv that tests HARDWARE decode of `master` on `gpu`. The trailing
+    scale_cuda/scale_vaapi filter is LOAD-BEARING, not decoration: `-hwaccel cuda|vaapi`
+    attaches to ffmpeg's native decoder, which SILENTLY falls back to CPU decoding when the GPU
+    lacks that codec. A GTX 970 (Maxwell GM204) can NVENC-ENCODE HEVC but has no HEVC NVDEC, so
+    the old filterless `-hwaccel cuda ... -f null` probe decoded 1 frame in software and wrongly
+    reported HEVC decode as supported — then the real per-stream transcode (which pipes frames
+    into scale_cuda) died with "received no packets" at run time. The real pipeline only accepts
+    GPU-resident frames, so a software-fallback frame can't survive scale_cuda/scale_vaapi.
+    Forcing the same GPU-only filter here makes the probe fail EXACTLY when the real run would,
+    so we never advertise a decode the card can't actually do (no silent CPU benchmarking)."""
+    base = [FFMPEG, "-hide_banner", "-loglevel", "error"]
+    tail = ["-frames:v", "1", "-an", "-noautoscale"]   # -noautoscale: same loop-seam reason as transcode_cmd
+    if gpu["api"] == "vaapi":
+        return base + ["-hwaccel", "vaapi", "-hwaccel_device", gpu["device"],
+                       "-hwaccel_output_format", "vaapi", "-i", master] + tail + \
+               ["-vf", "scale_vaapi=w=64:h=64", "-f", "null", "-"]
+    dev = ["-hwaccel_device", str(gpu["index"])] if gpu.get("index") is not None else []
+    return base + ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"] + dev + \
+           ["-i", master] + tail + ["-vf", "scale_cuda=64:64", "-f", "null", "-"]
+
+
 def decode_supported(gpu, codec):
-    """Can this GPU HARDWARE-decode this source codec? Decodes 1 frame of the probe clip on
-    the GPU; if the hw path is missing ffmpeg would fall to CPU and this returns False — which
-    is exactly what keeps an AV1-decode-incapable card from silently benchmarking the CPU."""
+    """Can this GPU HARDWARE-decode this source codec? Runs a 1-frame hardware decode that must
+    survive a GPU-only scale filter (see decode_probe_cmd for why that filter is essential). A
+    missing hw path fails the filter graph and returns False, so an AV1- or HEVC-decode-incapable
+    card is never offered that source and never silently benchmarks the CPU."""
     master = probe_clip(codec)          # decode capability is resolution-independent
     if not master:
         return codec == "hevc"          # no probe clip at all (dev build): assume only HEVC
-    if gpu["api"] == "vaapi":
-        cmd = [FFMPEG, "-hide_banner", "-loglevel", "error",
-               "-hwaccel", "vaapi", "-hwaccel_device", gpu["device"],
-               "-hwaccel_output_format", "vaapi", "-i", master,
-               "-frames:v", "1", "-an", "-f", "null", "-"]
-    else:  # nvenc/cuda
-        dev = ["-hwaccel_device", str(gpu["index"])] if gpu.get("index") is not None else []
-        cmd = [FFMPEG, "-hide_banner", "-loglevel", "error",
-               "-hwaccel", "cuda", "-hwaccel_output_format", "cuda"] + dev + \
-              ["-i", master, "-frames:v", "1", "-an", "-f", "null", "-"]
     try:
-        r = subprocess.run(cmd, env=stream_env(gpu),
+        r = subprocess.run(decode_probe_cmd(gpu, master), env=stream_env(gpu),
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
         return r.returncode == 0
     except Exception:
@@ -2164,7 +2203,7 @@ def _build_result(gpu, codec, confirmed_max, single, peak_combined, per_level,
         "idle_power_w": idle_w, "one_stream_power_w": one_w, "load_power_w": load_w,
         "peak_power_w": eff_power, "power_insight": insight, "temp_c": tele.get("temp"),
         "cpu": cpu_model(), "ram": STATE.get("ram_speed"), "ram_type": STATE.get("ram_type"),
-        "kernel": kernel_version(), "os_version": unraid_version(),
+        "kernel": kernel_version(), "os_version": os_version(),
     }
     return result, spw, power_estimated
 
@@ -2194,7 +2233,7 @@ def benchmark(gpu, codec="h264", input_codec="hevc", custom_path=None,
             "selected_codec": codec, "selected_input": input_codec,
             "selected_source_res": source_res, "selected_target_res": target_res,
             "selected_mode": mode,
-            "kernel": kernel_version(), "os_version": unraid_version(),
+            "kernel": kernel_version(), "os_version": os_version(),
             "cpu": None, "ram_speed": None, "ram_type": None, "ram_hint": None,
             "streams_per_watt": None, "result": None}
     # RAM speed/XMP matter whenever the transcode runs through SYSTEM memory: the iGPU (shares

@@ -36,6 +36,27 @@ Once it's running, open the WebUI on port `8088` and you'll get the picker scree
 
 ![The device picker showing the detected GPUs and CPU with the source and output options](images/picker.png)
 
+### Running it without Unraid
+
+You don't need Unraid to run this. It's a normal Docker container, so anything that runs Docker will do.
+
+The tidiest way is Docker Compose. There's a `docker-compose.yml` in the repo already set up for Intel and AMD, with the NVIDIA changes noted in the comments. Grab that file, then from the same folder run `docker compose up` and open port `8088` on the host. When you're done, `docker compose down` stops and removes it.
+
+If you'd rather do it in 1 line, here's the Intel or AMD version.
+
+```
+docker run --rm -p 8088:8088 \
+  --device /dev/dri:/dev/dri \
+  --tmpfs /ramdisk:rw,size=512m \
+  -v tgb-config:/config \
+  -v /etc/os-release:/os-release:ro \
+  spaceinvaderone/transcoding-gpu-benchmark:latest
+```
+
+For NVIDIA, drop the `--device /dev/dri` line, add `--runtime=nvidia`, and pass `-e NVIDIA_VISIBLE_DEVICES=all -e NVIDIA_DRIVER_CAPABILITIES=all`. You'll want the NVIDIA Container Toolkit installed on the host, the same bit of plumbing the Unraid Nvidia Driver plugin sets up for you.
+
+The one mount worth a word is `/etc/os-release`. That's how the leaderboard knows which OS you're on, it just reads your distro's name from it. Leave it off and everything still works, your result simply doesn't carry an OS. The compose file has the rest of the optional mounts in it as well, for CPU power readings and pointing it at your own video files, all commented out so you can switch on whatever you fancy.
+
 ### The first run downloads the test clips
 
 The image itself is small. The actual benchmark clips, which come to about 1.8 GB, download on your first run and get cached in `/config` so they're only ever fetched once. Container updates won't pull them again.

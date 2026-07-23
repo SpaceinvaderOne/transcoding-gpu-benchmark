@@ -681,13 +681,18 @@ function histogram(dist, med){
   return '<svg class="dots" viewBox="0 0 '+W+' '+H+'" preserveAspectRatio="xMidYMid meet">'+svg+'</svg>'
     +legend+'<div id="barinfo" class="barinfo" style="display:none"></div>';
 }
+// os_version is stored RAW. A bare Unraid-style version ("7.3.2", "6.12.10", "7.1.0-beta.4")
+// starts with a digit -> prefix the word "Unraid"; anything self-describing (an os-release
+// PRETTY_NAME like "Ubuntu 22.04.3 LTS", or "MOS 0.5.0") is shown as-is. This keeps every
+// existing numeric Unraid row rendering exactly as before while non-Unraid rows read correctly.
+function osLabel(v){ return /^[0-9]/.test(v) ? 'Unraid '+v : v; }
 function runLine(r){
   const lr = r.limit_reason;
   return '<b>'+r.max_sustained+' streams</b>'
     +(lr?'<span class="lbadge '+esc(lr)+'">'+esc(lr==="memory"?"VRAM wall":lr==="session"?"session cap":lr)+'</span>':'')
     +(r.capped&&r.projected?' · throughput ≈'+esc(String(r.projected))+'×':'')
     +(r.ram?' · '+esc(r.ram):'')+(r.cpu?' · '+esc(r.cpu):'')+(r.driver?' · '+esc(r.driver):'')
-    +(r.os_version?' · Unraid '+esc(r.os_version):'')
+    +(r.os_version?' · '+esc(osLabel(r.os_version)):'')
     +(r.updated_at?' · '+new Date(r.updated_at*1000).toLocaleDateString(undefined,{month:"short",day:"numeric"}):'');
 }
 function detailHtml(d){
@@ -999,7 +1004,7 @@ function metaTxt(r){
   bits.push("max "+r.max_sustained+" \\u00b7 single "+r.single_stream+"\\u00d7 \\u00b7 peak "+r.peak_combined+"\\u00d7");
   if(r.watts_per_stream!=null) bits.push(r.watts_per_stream+" W/stream");
   if(r.ram) bits.push(esc(r.ram)); if(r.driver) bits.push("drv "+esc(r.driver));
-  if(r.os_version) bits.push("OS "+esc(r.os_version));
+  if(r.os_version) bits.push(esc(osLabel(r.os_version)));
   if(r.limit_reason) bits.push("stopped: "+esc(r.limit_reason));
   if(r.hw_variant) bits.push(esc(r.hw_variant));
   return bits.join(" \\u00b7 ");

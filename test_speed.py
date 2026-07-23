@@ -899,6 +899,63 @@ class TestOsVersion(unittest.TestCase):
         self.assertLessEqual(len(benchmark.parse_os_version('version="' + "x" * 200 + '"')), 60)
 
 
+class TestOsRelease(unittest.TestCase):
+    """The non-Unraid fallback reads PRETTY_NAME from /etc/os-release. It must return a clean,
+    self-describing distro name and strip a trailing CPU-arch suffix."""
+    SAMPLE = ('NAME="Ubuntu"\nVERSION="22.04.3 LTS (Jammy Jellyfish)"\n'
+              'PRETTY_NAME="Ubuntu 22.04.3 LTS"\nID=ubuntu\nVERSION_ID="22.04"\n')
+
+    def test_ubuntu_pretty_name(self):
+        self.assertEqual(benchmark.parse_os_release(self.SAMPLE), "Ubuntu 22.04.3 LTS")
+
+    def test_debian_with_parens(self):
+        self.assertEqual(
+            benchmark.parse_os_release('PRETTY_NAME="Debian GNU/Linux 12 (bookworm)"\n'),
+            "Debian GNU/Linux 12 (bookworm)")
+
+    def test_strips_trailing_arch(self):
+        # Unraid's own os-release carries the arch; Unraid is read from the version file first,
+        # but the stripping must still work if we ever land here.
+        self.assertEqual(benchmark.parse_os_release('PRETTY_NAME="Unraid OS 7.3 x86_64"'),
+                         "Unraid OS 7.3")
+
+    def test_no_pretty_name(self):
+        self.assertIsNone(benchmark.parse_os_release('NAME="Foo"\nID=foo\n'))
+
+    def test_empty_or_none(self):
+        self.assertIsNone(benchmark.parse_os_release(""))
+        self.assertIsNone(benchmark.parse_os_release(None))
+
+    def test_capped_to_sane_length(self):
+        self.assertLessEqual(len(benchmark.parse_os_release('PRETTY_NAME="' + "x" * 200 + '"')), 60)
+
+
+class TestDecodeProbe(unittest.TestCase):
+    """The decode probe must pipe frames through a GPU-only scale filter so a silent CPU
+    fallback fails the probe instead of wrongly passing. A GTX 970 can NVENC-encode HEVC but
+    can't NVDEC-decode it; the old filterless probe decoded 1 frame in software and wrongly
+    reported HEVC decode as supported."""
+    def test_nvenc_probe_forces_gpu_scale(self):
+        cmd = benchmark.decode_probe_cmd({"api": "nvenc", "index": 0}, "/x/probe.mkv")
+        self.assertIn("scale_cuda=64:64", cmd)
+        self.assertIn("-noautoscale", cmd)
+        self.assertIn("cuda", cmd)                       # -hwaccel cuda
+
+    def test_vaapi_probe_forces_gpu_scale(self):
+        cmd = benchmark.decode_probe_cmd({"api": "vaapi", "device": "/dev/dri/renderD128"},
+                                         "/x/probe.mkv")
+        self.assertIn("scale_vaapi=w=64:h=64", cmd)
+        self.assertIn("-noautoscale", cmd)
+
+    def test_nvenc_device_index_threaded(self):
+        cmd = benchmark.decode_probe_cmd({"api": "nvenc", "index": 2}, "/x/probe.mkv")
+        self.assertEqual(cmd[cmd.index("-hwaccel_device") + 1], "2")
+
+    def test_nvenc_no_index_omits_device(self):
+        cmd = benchmark.decode_probe_cmd({"api": "nvenc", "index": None}, "/x/probe.mkv")
+        self.assertNotIn("-hwaccel_device", cmd)
+
+
 class TestHdrTonemap(unittest.TestCase):
     """HDR is a pseudo input codec: transcode_cmd grows a tone-map stage per vendor (chains
     validated live on real hardware incl. the -stream_loop seam). Output is always SDR 8-bit."""

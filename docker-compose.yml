@@ -1,0 +1,71 @@
+# Transcoding GPU Benchmark - docker compose for NON-Unraid hosts.
+#
+# Unraid users: install from Community Apps instead, you don't need this file.
+# This is for plain Docker on Ubuntu, Debian, Proxmox, TrueNAS Scale, and the like.
+#
+# The block below is set up for Intel / AMD GPUs (VAAPI via /dev/dri). For NVIDIA,
+# follow the two "NVIDIA:" notes further down.
+#
+#   docker compose up        # start, then open http://<host-ip>:8088 and watch it ramp
+#   docker compose down      # stop and remove when you're done
+#
+# It's a run-and-watch benchmark, not an always-on service: pick a GPU, start it,
+# watch the scoreboard reach the limit, then bring it down. Nothing else should be
+# using the GPU while it runs or the result is skewed.
+
+services:
+  benchmark:
+    image: spaceinvaderone/transcoding-gpu-benchmark:latest
+    container_name: transcoding-gpu-benchmark
+    ports:
+      - "8088:8088"
+
+    # --- GPU access ------------------------------------------------------------
+    # Intel / AMD: pass through the render device. Remove this on an NVIDIA-only host.
+    devices:
+      - /dev/dri:/dev/dri
+    # NVIDIA: comment out the `devices:` block above, uncomment the line below, and
+    # uncomment the NVIDIA_* environment vars near the bottom. The NVIDIA Container
+    # Toolkit must be installed on the host.
+    # runtime: nvidia
+
+    # --- Storage ---------------------------------------------------------------
+    volumes:
+      # App data: cached test clips, run history, install id, CPU baseline. Keep this
+      # so the clips download only once and your history + leaderboard identity persist.
+      - ./config:/config
+      # Keeps the Jellyfin base image from minting a stray anonymous volume each run.
+      - ./cache:/cache
+      # HOST OS name for the leaderboard - this is what makes the container multi-OS.
+      # It reads your distro's PRETTY_NAME (e.g. "Ubuntu 22.04.3 LTS"). Read-only.
+      # Without it the benchmark still runs; the OS column is just left blank.
+      - /etc/os-release:/os-release:ro
+      # A ~512 MB RAM disk holds the source clip during a run (fast, no disk writes).
+      - type: tmpfs
+        target: /ramdisk
+        tmpfs:
+          size: 536870912
+
+      # Optional extras (uncomment as wanted):
+      # Drop your own video files in ./input to benchmark them instead of the test clips:
+      # - ./input:/input:ro
+      # CPU package power for the "GPU is N× more efficient than CPU" comparison (RAPL,
+      # vendor-agnostic, no special caps needed):
+      # - /sys/devices/virtual/powercap:/powercap:ro
+      # RAM-speed readout on Intel iGPUs (raw SMBIOS table):
+      # - /sys/firmware/dmi/tables:/dmi:ro
+
+    # --- Optional extras -------------------------------------------------------
+    # Intel iGPU live telemetry (engine %, clock) via intel_gpu_top:
+    # cap_add:
+    #   - PERFMON
+    # Name which host apps are using a GPU in the pre-test busy check (read-only host
+    # process visibility; the check still warns without it, it just can't name the app):
+    # pid: host
+
+    # NVIDIA: uncomment these two when you switch on `runtime: nvidia` above.
+    # environment:
+    #   NVIDIA_VISIBLE_DEVICES: all
+    #   NVIDIA_DRIVER_CAPABILITIES: all
+
+    restart: "no"
