@@ -999,6 +999,8 @@ function esc(s){ return String(s==null?"":s).replace(/[&<>"]/g,c=>({"&":"&amp;",
 function curveTxt(pl){
   try{ const a=JSON.parse(pl||"[]"); return a.map(l=>l.worst).join(" \\u2192 "); }catch(e){ return ""; }
 }
+// same rule as the board page's osLabel — this is a separate document/scope, so it needs its own copy
+function osLabel(v){ return /^[0-9]/.test(v) ? 'Unraid '+v : v; }
 function metaTxt(r){
   const bits=[];
   bits.push("max "+r.max_sustained+" \\u00b7 single "+r.single_stream+"\\u00d7 \\u00b7 peak "+r.peak_combined+"\\u00d7");
