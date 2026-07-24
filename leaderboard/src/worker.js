@@ -601,6 +601,16 @@ tr.detail>td{background:#0a111d;padding:18px 22px}
 .barinfo{margin-top:8px;font-size:12.5px;color:#cdd9e8;background:#111b2b;border:1px solid #1e3048;border-radius:8px;padding:8px 12px;line-height:1.45}
 .punch{margin-top:10px;font-size:13.5px;font-weight:700;color:var(--green);line-height:1.4}
 .vramline{color:var(--ink);font-size:13.5px;line-height:1.45;margin:0 0 12px;padding:9px 13px;background:rgba(74,163,255,.08);border:1px solid rgba(74,163,255,.28);border-radius:9px}
+/* tap/hover tooltip popover (works on touch, unlike native title) + its ? marker */
+#tip{position:absolute;display:none;z-index:60;max-width:300px;background:#0e1826;border:1px solid #34506e;border-radius:9px;padding:9px 12px;font-size:12.5px;line-height:1.45;color:var(--ink);box-shadow:0 8px 24px rgba(0,0,0,.55);pointer-events:none;text-align:left}
+.tm{display:inline-block;width:15px;height:15px;line-height:15px;text-align:center;border-radius:50%;background:#233245;color:var(--muted);font-size:10px;font-weight:700;margin-left:5px;cursor:help;vertical-align:middle;text-transform:none;letter-spacing:0}
+.lbadge[data-tip]{cursor:help}
+/* "what do these mean" explainer panel */
+.guide{max-width:660px;margin:4px auto 16px;text-align:left;font-size:13px}
+.guide>summary{cursor:pointer;color:var(--accent);text-align:center;list-style:none;font-size:13.5px}
+.guide>summary::-webkit-details-marker{display:none}
+.guide .gbody{color:var(--muted);line-height:1.5;margin-top:10px;background:var(--panel);border:1px solid #1a2738;border-radius:10px;padding:12px 16px}
+.guide .gbody p{margin:0 0 9px}.guide .gbody p:last-child{margin:0}.guide .gbody b{color:var(--ink)}
 .ccount{color:var(--muted);font-size:12px}
 .prov{color:#f1c40f;font-size:11px;letter-spacing:.05em;text-transform:uppercase;margin-left:6px}
 .under{color:#f1c40f;font-size:12.5px;margin-top:3px}
@@ -654,6 +664,15 @@ td.effcell{color:var(--green)}
 <div class="stat" id="stat"></div>
 <div class="notice">New results go live <b>within about an hour</b>. Anything that doesn't look right is held for a quick manual check first.</div>
 <div class="sub" id="sub">Simultaneous <b>4K HEVC → 1080p H.264 (8M)</b> streams at ≥ 1.0× realtime · median of community submissions · click a row for the breakdown</div>
+<details class="guide"><summary>What do these numbers mean?</summary><div class="gbody">
+<p><b>Streams (median)</b> is how many 4K films the card can transcode down to 1080p at the same time while every one stays above realtime. We rank by the median of clean runs rather than the single best, so it reflects a typical result and not a lucky one.</p>
+<p><b>≈W/stream</b> is the power used per simultaneous stream, so lower is more efficient. An Intel iGPU sips power, while a big discrete card only looks efficient once it's running plenty of streams.</p>
+<p><b>Capacity</b> such as <b>· 16 GB</b> shows how much video memory a discrete card has. The 8 GB and 16 GB versions of the same card are listed separately, because for transcoding the amount of VRAM often decides how many streams fit.</p>
+<p><b>Why a card stops</b> comes down to 1 of 3 things. A <b>VRAM wall</b> means it ran out of video memory, so a bigger-memory version would go further. A <b>session cap</b> means it hit the NVIDIA driver limit on simultaneous encodes rather than a hardware limit. <b>Throughput</b> means it ran out of engine speed, and more VRAM wouldn't help.</p>
+<p><b>Locked and unlocked</b> refer to the NVIDIA driver cap on how many encodes run at once. Some people patch that limit away, so a locked and an unlocked card are shown separately.</p>
+<p><b>Provisional</b> means there's only 1 clean run so far, so the number may move as more people submit the same card.</p>
+<p><b>DDR4 and DDR5</b> matter because an integrated GPU borrows system memory as its video memory, so faster RAM moves the score. We split iGPUs by memory generation for a fair comparison.</p>
+</div></details>
 <div class="pillrows" id="pillrows" style="display:none">
   <div class="prow"><span class="plab">Source</span><span class="pset" id="srcs"></span></div>
   <div class="prow"><span class="plab">Output</span><span class="pset" id="outs"></span></div>
@@ -664,12 +683,27 @@ td.effcell{color:var(--green)}
   <button id="vt" class="vtbtn" onclick="toggleView()">Show all runs &amp; failure detail</button>
 </div>
 <div id="xprof" class="xprof" style="display:none"></div>
-<table id="t"><thead><tr><th></th><th>GPU</th><th class="sortable" data-k="median_streams">Streams (median)<span class="arr" id="a-median_streams"></span></th><th class="sortable" data-k="best_streams">Best<span class="arr" id="a-best_streams"></span></th><th class="sortable eff" data-k="median_wps">≈W/stream<span class="arr" id="a-median_wps"></span></th><th class="sortable" data-k="count">Runs<span class="arr" id="a-count"></span></th></tr></thead>
+<table id="t"><thead><tr><th></th><th>GPU</th><th class="sortable" data-k="median_streams">Streams (median)<span class="tm" data-tip="How many 4K to 1080p transcodes the card kept above realtime all at once. We show the median of clean runs, not the single best, so it's what you'd typically get.">?</span><span class="arr" id="a-median_streams"></span></th><th class="sortable" data-k="best_streams">Best<span class="arr" id="a-best_streams"></span></th><th class="sortable eff" data-k="median_wps">≈W/stream<span class="tm" data-tip="Power used per simultaneous stream, in watts. Lower is more efficient. An iGPU sips power; a big discrete card only looks efficient when it's running lots of streams.">?</span><span class="arr" id="a-median_wps"></span></th><th class="sortable" data-k="count">Runs<span class="arr" id="a-count"></span></th></tr></thead>
 <tbody id="tb"><tr><td colspan="6" class="empty">Loading…</td></tr></tbody></table>
 <div class="showall" id="showall" style="display:none"><button onclick="SHOWALL=true;renderRows()"></button></div>
 <div class="foot">Run it on your own Unraid server — search <b>Transcoding GPU Benchmark</b> in Community Apps.</div>
-</div><script>
+</div><div id="tip"></div><script>
 const esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+// tap/hover tooltip: any [data-tip] element shows a popover on hover (desktop) or tap (touch).
+// Delegated on document so it also catches badges rendered later in the drill-down.
+const TIP=document.getElementById("tip");
+function showTip(el){
+  const t=el.getAttribute("data-tip"); if(!t){TIP.style.display="none";return;}
+  TIP.textContent=t; TIP.style.display="block";
+  const r=el.getBoundingClientRect(), vw=document.documentElement.clientWidth;
+  let left=r.left+r.width/2-TIP.offsetWidth/2+window.scrollX;
+  left=Math.max(8+window.scrollX,Math.min(left,window.scrollX+vw-TIP.offsetWidth-8));
+  TIP.style.left=left+"px"; TIP.style.top=(r.bottom+window.scrollY+7)+"px";
+}
+document.addEventListener("mouseover",e=>{const el=e.target.closest("[data-tip]"); if(el) showTip(el);});
+document.addEventListener("mouseout",e=>{if(e.target.closest("[data-tip]")) TIP.style.display="none";});
+document.addEventListener("click",e=>{const el=e.target.closest("[data-tip]"); if(el) showTip(el); else TIP.style.display="none";});
+document.addEventListener("scroll",()=>{TIP.style.display="none";},true);
 const median=a=>{const s=[...a].sort((x,y)=>x-y);return s.length?(s.length%2?s[(s.length-1)/2]:(s[s.length/2-1]+s[s.length/2])/2):null};
 // weighted median over [{v, c}] pairs — exact, from the GROUP BY distribution
 function wmedian(pairs){
@@ -749,10 +783,15 @@ function histogram(dist, med){
 // PRETTY_NAME like "Ubuntu 22.04.3 LTS", or "MOS 0.5.0") is shown as-is. This keeps every
 // existing numeric Unraid row rendering exactly as before while non-Unraid rows read correctly.
 function osLabel(v){ return /^[0-9]/.test(v) ? 'Unraid '+v : v; }
+const LR_TIP={
+  memory:"The card ran out of video memory before it ran out of engine power, so a version of the same card with more VRAM would go further.",
+  session:"It hit the NVIDIA driver limit on how many encodes run at once, not a hardware limit. Some drivers can be patched to lift it.",
+  throughput:"The card ran out of engine speed, not memory, so more VRAM wouldn't add streams here.",
+  unknown:"The reason it stopped couldn't be classified from this run."};
 function runLine(r){
   const lr = r.limit_reason;
   return '<b>'+r.max_sustained+' streams</b>'
-    +(lr?'<span class="lbadge '+esc(lr)+'">'+esc(lr==="memory"?"VRAM wall":lr==="session"?"session cap":lr)+'</span>':'')
+    +(lr?'<span class="lbadge '+esc(lr)+'" data-tip="'+esc(LR_TIP[lr]||"")+'">'+esc(lr==="memory"?"VRAM wall":lr==="session"?"session cap":lr)+'</span>':'')
     +(r.capped&&r.projected?' · throughput ≈'+esc(String(r.projected))+'×':'')
     +(r.ram?' · '+esc(r.ram):'')+(r.cpu?' · '+esc(r.cpu):'')+(r.driver?' · '+esc(r.driver):'')
     +(r.os_version?' · '+esc(osLabel(r.os_version)):'')
@@ -995,7 +1034,7 @@ function loadBoard(){
     ROWS=d.rows||[]; renderRows();
   });
 }
-document.querySelectorAll("th.sortable").forEach(th=>th.addEventListener("click",()=>setSort(th.dataset.k)));
+document.querySelectorAll("th.sortable").forEach(th=>th.addEventListener("click",e=>{if(e.target.closest("[data-tip]"))return;setSort(th.dataset.k);}));
 document.getElementById("q").addEventListener("input",e=>{Q=e.target.value.trim();SHOWALL=false;renderRows();});
 renderChips();
 fetch("/api/profiles").then(r=>r.json()).then(d=>{
