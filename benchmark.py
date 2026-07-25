@@ -94,7 +94,7 @@ DYNAMIX_CFG     = _env("DYNAMIX_CFG", "/dynamix.cfg")  # optional RO mount of Un
 # will move to gpu.spaceinvader.one once the domain's DNS is on Cloudflare. Setting the env var
 # to empty/whitespace disables submission entirely (the Submit button never shows).
 SUBMIT_URL      = _env("SUBMIT_URL", "https://gpu.spaceinvader.one/api/submit").strip()
-TOOL_VERSION    = "1.3"
+TOOL_VERSION    = "1.4"
 
 # SMBIOS Memory Device "Memory Type" enum (subset)
 MEM_TYPE = {0x13: "DDR", 0x14: "DDR2", 0x18: "DDR3", 0x1A: "DDR4", 0x1E: "LPDDR",
@@ -375,6 +375,84 @@ def engine_pct(delta_ns, dt_s, cap):
     cap = cap or 1
     pct = 100.0 * delta_ns / (dt_s * 1e9 * cap)
     return round(max(0.0, min(100.0, pct)), 1)
+
+
+def _mem_kib(v):
+    """A DRM fdinfo memory value ("40972 KiB", "12 MiB", "0") -> KiB."""
+    m = re.match(r"(\d+)\s*(\w*)", v or "")
+    if not m:
+        return 0
+    n, unit = int(m.group(1)), m.group(2)
+    return {"": n // 1024 if n else 0, "B": n // 1024, "KiB": n,
+            "MiB": n * 1024, "GiB": n * 1024 * 1024}.get(unit, n)
+
+
+def parse_xe_fdinfo(text):
+    """Parse an Intel xe/i915 DRM fdinfo (Arc dGPUs — captured from a real Arc Pro B50).
+    VRAM held by the client is drm-resident-vramN (xe) / drm-resident-localN (i915 dGPUs),
+    in KiB/MiB. Media engines are CYCLE counters (not the ns accumulators amdgpu uses):
+    drm-cycles-vcs (video decode+encode, capacity 2 on Battlemage) and drm-cycles-vecs
+    (video enhance — scale_vaapi lands here), each against the free-running
+    drm-total-cycles-* wall counter. Returns {vram_kib, cycles, pdev, client} or {}."""
+    kv = {}
+    for line in (text or "").splitlines():
+        if ":" in line:
+            k, _, v = line.partition(":")
+            kv[k.strip()] = v.strip()
+    if kv.get("drm-driver") not in ("xe", "i915"):
+        return {}
+    vram_kib = 0
+    for k, v in kv.items():
+        if re.fullmatch(r"drm-resident-(vram|local)\d+", k):
+            vram_kib += _mem_kib(v)
+
+    def _num(key):
+        m = re.search(r"\d+", kv.get(key, ""))
+        return int(m.group()) if m else 0
+
+    cycles = {"vcs": _num("drm-cycles-vcs"), "vcs_total": _num("drm-total-cycles-vcs"),
+              "vcs_cap": _num("drm-engine-capacity-vcs") or 1,
+              "vecs": _num("drm-cycles-vecs"), "vecs_total": _num("drm-total-cycles-vecs"),
+              "vecs_cap": _num("drm-engine-capacity-vecs") or 1}
+    return {"vram_kib": vram_kib, "cycles": cycles,
+            "pdev": kv.get("drm-pdev"), "client": kv.get("drm-client-id")}
+
+
+def cycle_pct(d_cycles, d_total, cap):
+    """xe engine busy% from cycle-counter deltas: busy ÷ (wall × instances), clamped [0,100].
+    None when the wall window is non-positive (can't divide)."""
+    if not d_total or d_total <= 0:
+        return None
+    cap = cap or 1
+    return round(max(0.0, min(100.0, 100.0 * d_cycles / (d_total * cap))), 1)
+
+
+def parse_bar_vram_mb(resource_text):
+    """VRAM total (MB) from a PCI `resource` file: the largest MEM BAR (flag 0x200). Every
+    xe-driven card requires resizable BAR, so the BAR spans the whole VRAM — the real B50
+    exposes exactly 16 GiB. A best BAR under 1 GiB is a legacy 256 MB aperture window, NOT
+    the VRAM size → None (unknown, never guessed)."""
+    best = 0
+    for line in (resource_text or "").splitlines():
+        parts = line.split()
+        if len(parts) >= 3:
+            try:
+                start, end, flags = (int(p, 16) for p in parts[:3])
+            except ValueError:
+                continue
+            if flags & 0x200 and end > start:          # IORESOURCE_MEM
+                best = max(best, end - start + 1)
+    return round(best / 1048576.0, 1) if best >= 1024 ** 3 else None
+
+
+def vram_capable(gpu):
+    """Which devices get VRAM accounting: NVIDIA/AMD dGPUs (nvidia-smi / amdgpu fdinfo) plus
+    Intel Arc dGPUs (xe/i915 fdinfo). iGPUs and the CPU share system RAM — nothing to track
+    (an AMD APU flipped to is_igpu by the link heuristic is excluded the same way)."""
+    v = gpu.get("vendor")
+    if v == "intel":
+        return not gpu.get("is_igpu")
+    return v in ("nvidia", "amd") and not gpu.get("is_igpu")
 
 
 def smbios_mem_speeds(data):
@@ -672,6 +750,14 @@ def read_cpu_package_temp():
         if t is not None:
             return t
     return None
+
+
+def _pci_link_unknown(pci):
+    """True when the device reports no PCIe link speed — the tell for an INTEGRATED GPU
+    (root-complex endpoints have no link, so the PCI core says "Unknown"; every physical
+    card reports a real speed). Unreadable counts as unknown → treated as integrated."""
+    v = (_read(f"/sys/bus/pci/devices/{pci}/current_link_speed") or "").strip()
+    return (not v) or v.lower().startswith("unknown")
 
 
 def _pci_name(pci_addr):
@@ -1495,7 +1581,14 @@ def detect_gpus():
         else:
             continue  # NVIDIA / other render nodes are handled via nvidia-smi, not VAAPI
         name = _pci_name(pci) or ("Intel GPU" if vendor == "intel" else "AMD GPU")
-        is_igpu = vendor == "intel" and bool(pci) and pci.startswith("0000:00:")
+        # integrated vs discrete. Intel iGPUs always sit on the root bus (00:02.0) — an Arc
+        # card never does. AMD needs a different tell (APU graphics hides behind internal
+        # bridges on a non-zero bus): an integrated GPU has NO PCIe link, so the PCI core
+        # reports current_link_speed "Unknown", while every physical card reports a real
+        # speed (verified: Arrow Lake/UHD 770 iGPUs = Unknown; B50/5090 dGPUs = real).
+        # Without this, an APU's shared-RAM carve-out masquerades as VRAM on the board.
+        is_igpu = (vendor == "intel" and bool(pci) and pci.startswith("0000:00:")) or \
+                  (vendor == "amd" and bool(pci) and _pci_link_unknown(pci))
         # kernel DRM driver (i915 / xe / amdgpu) from the device's driver symlink
         kdrv = None
         dl = f"/sys/class/drm/{base}/device/driver"
@@ -2112,10 +2205,10 @@ def run_level(gpu, src, codec, n, last_passing, target_res="1080p", ten_bit=Fals
     # dGPU VRAM accounting at END of hold — allocations are fully settled here (sampling at
     # hold-START catches sessions mid-allocation at high N and garbles the slope)
     vram_ours = vram_free = None
-    if gpu.get("vendor") in ("nvidia", "amd"):
+    if vram_capable(gpu):
         vram_ours = gpu_mem_ours(gpu)
-        g = gpu_mem_global(gpu)
-        if g:
+        g = gpu_mem_global(gpu)                    # None on Intel Arc (no global counter) — the
+        if g:                                      # per-session slope still comes from vram_ours
             vram_free = round(g[1] - g[0], 1)
 
     for s in streams:
@@ -2328,11 +2421,18 @@ def benchmark(gpu, codec="h264", input_codec="hevc", custom_path=None,
         vram_free_last = None
         vram_total = None
         wall_pred = None         # live VRAM-wall prediction once the slope stabilises
-        if gpu.get("vendor") in ("nvidia", "amd"):
+        g0 = None
+        if vram_capable(gpu):
             g0 = gpu_mem_global(gpu)
             if g0:
                 vram_total = round(g0[1], 1)
-        vram_free_start = round(g0[1] - g0[0], 1) if (gpu.get("vendor") in ("nvidia", "amd") and g0) else None
+            elif gpu.get("vendor") == "intel":
+                # xe exposes no container-readable global used/total — total comes from the
+                # PCI BAR (spans the whole VRAM on ReBAR cards; None on a legacy aperture).
+                # free_start stays None: co-tenant usage is invisible, and an honest None
+                # beats pretending the card started empty.
+                vram_total = arc_vram_total_mb(gpu.get("pci"))
+        vram_free_start = round(g0[1] - g0[0], 1) if g0 else None
         ramp_max = MAX_STREAMS if mode == "streaming" else CONV_MAX_STREAMS
         for n in range(1, ramp_max + 1):
             if _ABORT.is_set():
@@ -3231,6 +3331,23 @@ def gpu_mem_ours(gpu):
                     if m:
                         total += int(m.group(1)) / 1024.0      # KiB -> MB
             return round(total, 1)
+        if gpu["vendor"] == "intel":
+            # Arc dGPU (xe/i915): resident VRAM from our children's fdinfo, same
+            # no-caps-needed pattern as AMD (validated live on an Arc Pro B50)
+            total, seen = 0.0, set()
+            for pid in pids:
+                for fi in glob.glob(f"/proc/{pid}/fdinfo/*"):
+                    d = parse_xe_fdinfo(_read(fi) or "")
+                    if not d:
+                        continue
+                    if gpu.get("pci") and d["pdev"] and d["pdev"] != gpu["pci"]:
+                        continue
+                    cid = (pid, d["client"])
+                    if cid in seen:
+                        continue
+                    seen.add(cid)
+                    total += d["vram_kib"] / 1024.0            # KiB -> MB
+            return round(total, 1)
     except Exception:
         pass
     return None
@@ -3298,6 +3415,134 @@ def _amd_telemetry(gpu, gen):
                         engines["Video Scaler"] = scaler
             prev_enc, prev_dec, prev_comp, prev_t = e_ns, d_ns, c_ns, now
             _tele_set(gen, util=util, power=power, power_max=pmax, temp=temp, engines=engines)
+        except Exception:
+            pass
+        _TELE_STOP.wait(1.0)
+
+
+def arc_vram_total_mb(pci):
+    """Intel Arc VRAM total via the PCI BAR (see parse_bar_vram_mb). None when unknowable."""
+    if not pci:
+        return None
+    return parse_bar_vram_mb(_read(f"/sys/bus/pci/devices/{pci}/resource"))
+
+
+def _arc_hwmon(pci):
+    """The card's own hwmon dir (name 'xe' or 'i915'), else the first one under its PCI dev."""
+    dirs = sorted(glob.glob(f"/sys/bus/pci/devices/{pci}/hwmon/hwmon*/"))
+    for d in dirs:
+        if (_read(d + "name") or "").strip() in ("xe", "i915"):
+            return d
+    return dirs[0] if dirs else None
+
+
+def _arc_energy_file(hw):
+    """The BOARD energy counter: the energyN channel labelled 'card' (the B50's xe hwmon has
+    energy1=card + energy2=pkg — card is the whole-board figure that matches the 70 W TBP),
+    falling back to energy1_input where labels are absent."""
+    for f in sorted(glob.glob(hw + "energy*_label")):
+        if (_read(f) or "").strip() == "card":
+            return f.replace("_label", "_input")
+    f = hw + "energy1_input"
+    return f if os.path.exists(f) else None
+
+
+def _arc_engine_totals(pci):
+    """Sum xe media-engine cycle counters across OUR ffmpeg streams' DRM clients on this card
+    (same pattern as _amd_engine_totals: own children only, dedupe by client id, filter by
+    PCI). The total-cycles wall counter is free-running and identical across clients, so it
+    aggregates by max, not sum. Returns the dict or None when no client is up yet."""
+    with _REG_LOCK:
+        pids = [s.proc.pid for s in _ALL_STREAMS if s.proc is not None]
+    agg = {"vcs": 0, "vecs": 0, "vcs_total": 0, "vecs_total": 0, "vcs_cap": 1, "vecs_cap": 1}
+    seen, found = set(), False
+    for pid in pids:
+        for fi in glob.glob(f"/proc/{pid}/fdinfo/*"):
+            d = parse_xe_fdinfo(_read(fi) or "")
+            if not d:
+                continue
+            if pci and d["pdev"] and d["pdev"] != pci:
+                continue
+            cid = (pid, d["client"])
+            if cid in seen:
+                continue
+            seen.add(cid)
+            found = True
+            c = d["cycles"]
+            agg["vcs"] += c["vcs"]
+            agg["vecs"] += c["vecs"]
+            agg["vcs_total"] = max(agg["vcs_total"], c["vcs_total"])
+            agg["vecs_total"] = max(agg["vecs_total"], c["vecs_total"])
+            agg["vcs_cap"] = max(agg["vcs_cap"], c["vcs_cap"])
+            agg["vecs_cap"] = max(agg["vecs_cap"], c["vecs_cap"])
+    return agg if found else None
+
+
+def _arc_telemetry(gpu, gen):
+    """Intel Arc dGPU (xe/i915): REAL board power from the card's own hwmon — power1_input
+    when the driver provides it, else the µJ energy counter sampled as a delta (the xe way;
+    validated 21 W idle → 31 W under load on a real B50) — plus GPU temp and media-engine
+    busy% from our own streams' fdinfo cycle counters. This replaces the old fallthrough to
+    _intel_telemetry, whose CPU-package figure had nothing to do with the card (a B60 showed
+    133 W 'pkg power' while actually drawing ~35 W)."""
+    pci = gpu.get("pci")
+    hw = _arc_hwmon(pci) if pci else None
+    efile = _arc_energy_file(hw) if hw else None
+    # temp channel: prefer the one labelled pkg (xe: temp2=pkg, temp3=vram)
+    tfile = None
+    if hw:
+        for f in sorted(glob.glob(hw + "temp*_label")):
+            if (_read(f) or "").strip() == "pkg":
+                tfile = f.replace("_label", "_input")
+                break
+        if tfile is None:
+            tins = sorted(glob.glob(hw + "temp*_input"))
+            tfile = tins[0] if tins else None
+    prev_e = prev_et = None
+    prev_c = prev_t = None
+    while not _TELE_STOP.is_set() and gen == _TELE_GEN:
+        try:
+            power = temp = pmax = None
+            if hw:
+                pw = _read(hw + "power1_input") or _read(hw + "power1_average")
+                now = time.monotonic()
+                if pw is not None:
+                    power = round(_f(pw) / 1e6, 1)               # µW -> W
+                elif efile:
+                    e = _f(_read(efile))                          # µJ counter -> delta watts
+                    if e is not None:
+                        if prev_e is not None and now > prev_et and e >= prev_e:
+                            power = round((e - prev_e) / (now - prev_et) / 1e6, 1)
+                        prev_e, prev_et = e, now
+                pc = _read(hw + "power1_cap") or _read(hw + "power1_max")
+                if pc is not None and _f(pc):
+                    pmax = round(_f(pc) / 1e6, 1)
+                if tfile:
+                    tp = _read(tfile)
+                    if tp is not None:
+                        temp = round(_f(tp) / 1000.0, 1)          # m°C -> °C
+            # media engines from our own streams (delta over the sample window):
+            # vcs = decode+encode ("Video"), vecs = the VPP scaler ("Video Enhance")
+            engines = None
+            cur = _arc_engine_totals(pci)
+            now2 = time.monotonic()
+            if cur and prev_c is not None:
+                video = cycle_pct(cur["vcs"] - prev_c["vcs"],
+                                  cur["vcs_total"] - prev_c["vcs_total"], cur["vcs_cap"])
+                enh = cycle_pct(cur["vecs"] - prev_c["vecs"],
+                                cur["vecs_total"] - prev_c["vecs_total"], cur["vecs_cap"])
+                if video is not None:
+                    engines = {"Video": video}
+                    if enh is not None:
+                        engines["Video Enhance"] = enh
+            if cur:
+                prev_c, prev_t = cur, now2
+            # publish only what was actually read this tick — a None must not clobber the
+            # previous good value (and gpu_busy iterates engines, so never store None there)
+            kw = {k: v for k, v in dict(power=power, power_max=pmax, temp=temp,
+                                        engines=engines).items() if v is not None}
+            if kw:
+                _tele_set(gen, **kw)
         except Exception:
             pass
         _TELE_STOP.wait(1.0)
@@ -3427,7 +3672,7 @@ def gpu_busy(gpu):
             load = None
         return ((load or 0.0) >= BUSY_THRESHOLD, round(load or 0.0, 1))
     if gpu["vendor"] == "intel":
-        eng = tel.get("engines", {})
+        eng = tel.get("engines") or {}     # `or {}`: a sampler may have published None
         load = max([v for n, v in eng.items() if "Video" in n] or [0.0])
     elif gpu["vendor"] == "nvidia":
         load = max(tel.get("enc") or 0.0, tel.get("util") or 0.0)
@@ -3450,6 +3695,8 @@ def start_telemetry(gpu):
     _RAPL_ACTIVE = bool(rapl)
     target = {"nvidia": _nvidia_telemetry, "amd": _amd_telemetry,
               "cpu": _cpu_telemetry}.get(gpu["vendor"], _intel_telemetry)
+    if gpu["vendor"] == "intel" and not gpu.get("is_igpu"):
+        target = _arc_telemetry           # Arc dGPU: its own hwmon, not intel_gpu_top/CPU pkg
     threading.Thread(target=target, args=(gpu, gen), daemon=True).start()
     if gpu["vendor"] == "cpu" and not rapl:
         # package-power fallback: Intel box with PERFMON but no /powercap mount

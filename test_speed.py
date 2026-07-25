@@ -930,6 +930,132 @@ class TestOsRelease(unittest.TestCase):
         self.assertLessEqual(len(benchmark.parse_os_release('PRETTY_NAME="' + "x" * 200 + '"')), 60)
 
 
+XE_FDINFO_SAMPLE = """pos:\t0
+flags:\t0100002
+mnt_id:\t97
+ino:\t14
+drm-driver:\txe
+drm-client-id:\t17558
+drm-pdev:\t0000:04:00.0
+drm-total-system:\t0
+drm-resident-system:\t0
+drm-total-gtt:\t12 MiB
+drm-resident-gtt:\t12 MiB
+drm-total-vram0:\t40972 KiB
+drm-shared-vram0:\t0
+drm-active-vram0:\t40772 KiB
+drm-resident-vram0:\t40972 KiB
+drm-total-stolen:\t0
+drm-resident-stolen:\t0
+drm-cycles-rcs:\t0
+drm-total-cycles-rcs:\t2072727642368
+drm-cycles-vcs:\t8000
+drm-total-cycles-vcs:\t2072727642368
+drm-engine-capacity-vcs:\t2
+drm-cycles-vecs:\t63638128
+drm-total-cycles-vecs:\t2072727642368
+drm-engine-capacity-vecs:\t2
+"""
+
+
+class TestXeFdinfo(unittest.TestCase):
+    """Intel xe (Battlemage) / i915 (Alchemist) fdinfo parsing — captured from a live ffmpeg
+    VAAPI transcode on a real Arc Pro B50 (xe, kernel 6.18). VRAM lives in drm-resident-vram0
+    (KiB), media engines in cycle counters: vcs = video decode+encode, vecs = video enhance."""
+    def test_vram_resident_kib(self):
+        d = benchmark.parse_xe_fdinfo(XE_FDINFO_SAMPLE)
+        self.assertEqual(d["vram_kib"], 40972)
+
+    def test_mib_region_converts(self):
+        d = benchmark.parse_xe_fdinfo(
+            "drm-driver:\txe\ndrm-client-id:\t1\ndrm-resident-vram0:\t12 MiB\n")
+        self.assertEqual(d["vram_kib"], 12288)
+
+    def test_i915_local_region(self):
+        # Alchemist dGPUs run i915, whose VRAM regions are named localN
+        d = benchmark.parse_xe_fdinfo(
+            "drm-driver:\ti915\ndrm-client-id:\t2\ndrm-resident-local0:\t2048 KiB\n")
+        self.assertEqual(d["vram_kib"], 2048)
+
+    def test_cycles_and_capacity(self):
+        d = benchmark.parse_xe_fdinfo(XE_FDINFO_SAMPLE)
+        self.assertEqual(d["cycles"]["vcs"], 8000)
+        self.assertEqual(d["cycles"]["vcs_cap"], 2)
+        self.assertEqual(d["cycles"]["vecs"], 63638128)
+        self.assertEqual(d["cycles"]["vcs_total"], 2072727642368)
+
+    def test_pdev_and_client(self):
+        d = benchmark.parse_xe_fdinfo(XE_FDINFO_SAMPLE)
+        self.assertEqual(d["pdev"], "0000:04:00.0")
+        self.assertEqual(d["client"], "17558")
+
+    def test_wrong_driver_rejected(self):
+        self.assertEqual(benchmark.parse_xe_fdinfo("drm-driver:\tamdgpu\ndrm-memory-vram:\t100\n"), {})
+        self.assertEqual(benchmark.parse_xe_fdinfo(""), {})
+
+
+class TestCyclePct(unittest.TestCase):
+    """xe engine busy% from cycle deltas: busy / (wall × instances), clamped [0,100]."""
+    def test_half_busy_single(self):
+        self.assertEqual(benchmark.cycle_pct(500, 1000, 1), 50.0)
+
+    def test_capacity_divides(self):
+        # both instances of a capacity-2 engine flat out = Δcycles of 2× total
+        self.assertEqual(benchmark.cycle_pct(2000, 1000, 2), 100.0)
+        self.assertEqual(benchmark.cycle_pct(1000, 1000, 2), 50.0)
+
+    def test_clamps_and_guards(self):
+        self.assertEqual(benchmark.cycle_pct(5000, 1000, 1), 100.0)
+        self.assertEqual(benchmark.cycle_pct(-5, 1000, 1), 0.0)
+        self.assertIsNone(benchmark.cycle_pct(10, 0, 1))
+        self.assertIsNone(benchmark.cycle_pct(10, None, 1))
+
+
+class TestBarVram(unittest.TestCase):
+    """VRAM total from the PCI `resource` file — the largest MEM BAR. On every xe-driven card
+    (Battlemage requires ReBAR) the BAR spans the whole VRAM: the real B50 exposes exactly
+    16 GiB. A sub-1-GiB best BAR means no ReBAR window — that is NOT the VRAM size, so None."""
+    B50 = ("0x0000000050000000 0x0000000050ffffff 0x0000000000040200\n"
+           "0x0000006000000000 0x00000063ffffffff 0x000000000014220c\n"
+           "0x0000000000000000 0x0000000000000000 0x0000000000000000\n")
+
+    def test_b50_16gb(self):
+        self.assertEqual(benchmark.parse_bar_vram_mb(self.B50), 16384.0)
+
+    def test_no_rebar_returns_none(self):
+        small = "0x0000000050000000 0x000000005fffffff 0x000000000014220c\n"  # 256 MiB window
+        self.assertIsNone(benchmark.parse_bar_vram_mb(small))
+
+    def test_garbage_and_empty(self):
+        self.assertIsNone(benchmark.parse_bar_vram_mb(""))
+        self.assertIsNone(benchmark.parse_bar_vram_mb(None))
+        self.assertIsNone(benchmark.parse_bar_vram_mb("not hex at all\n"))
+
+    def test_io_bars_ignored(self):
+        # an IO-port BAR (no MEM flag 0x200) must not count even if huge
+        io = "0x0000000000000000 0x00000063ffffffff 0x0000000000000100\n"
+        self.assertIsNone(benchmark.parse_bar_vram_mb(io))
+
+
+class TestVramCapable(unittest.TestCase):
+    """Which devices get VRAM accounting: NVIDIA/AMD dGPUs + Intel Arc dGPUs (xe/i915 fdinfo).
+    iGPUs and the CPU share system RAM — nothing to track."""
+    def test_nvidia_amd_dgpu(self):
+        self.assertTrue(benchmark.vram_capable({"vendor": "nvidia", "is_igpu": False}))
+        self.assertTrue(benchmark.vram_capable({"vendor": "amd", "is_igpu": False}))
+
+    def test_intel_arc_dgpu(self):
+        self.assertTrue(benchmark.vram_capable({"vendor": "intel", "is_igpu": False}))
+
+    def test_intel_igpu_and_cpu_excluded(self):
+        self.assertFalse(benchmark.vram_capable({"vendor": "intel", "is_igpu": True}))
+        self.assertFalse(benchmark.vram_capable({"vendor": "cpu", "is_igpu": False}))
+
+    def test_amd_apu_excluded(self):
+        # an APU flipped to is_igpu by the link heuristic must not get VRAM accounting
+        self.assertFalse(benchmark.vram_capable({"vendor": "amd", "is_igpu": True}))
+
+
 class TestDecodeProbe(unittest.TestCase):
     """The decode probe must pipe frames through a GPU-only scale filter so a silent CPU
     fallback fails the probe instead of wrongly passing. A GTX 970 can NVENC-encode HEVC but
