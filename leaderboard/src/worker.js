@@ -325,6 +325,7 @@ async function handleTop(url, env) {
   const { results } = await env.DB.prepare(
     `SELECT gpu, vendor, max_sustained, capped, projected, watts_per_stream, ram,
             CAST(json_extract(raw,'$.result.busy_load') AS REAL) AS busy_load,
+            vram_mb,
             CAST(json_extract(raw,'$.result.vram_total_mb') AS REAL) AS vt,
             CAST(json_extract(raw,'$.result.vram_free_start_mb') AS REAL) AS vf,
             json_extract(raw,'$.result.is_igpu') AS is_igpu,
@@ -353,7 +354,10 @@ async function handleTop(url, env) {
     const gen = igpu ? (ramGen(row.ram) || "RAM unknown") : null;
     // dGPU VRAM capacity splits variants of the same card (8 GB vs 16 GB), the same way RAM
     // generation splits an iGPU. Shown inline "· 16 GB" like the "(DDR5)" tag.
-    const vram = igpu ? null : vramBucket(row.vt);
+    // curated override first (vram_mb: >0 = backfilled capacity, 0 = suppress a bogus APU
+    // carve-out reading), else the client-measured value from the envelope
+    const vtEff = row.vram_mb != null ? (row.vram_mb > 0 ? row.vram_mb : null) : row.vt;
+    const vram = igpu ? null : vramBucket(vtEff);
     const entity = gen ? row.gpu + " (" + gen + ")"
                  : vram ? row.gpu + " · " + vram + " GB"
                  : row.gpu;
@@ -443,8 +447,11 @@ async function handleDetail(url, env) {
   if (vram) {
     const b = vramBounds(parseInt(vram, 10));
     if (b) {
-      where += " AND CAST(json_extract(raw,'$.result.vram_total_mb') AS REAL) >= ?"
-             + " AND CAST(json_extract(raw,'$.result.vram_total_mb') AS REAL) < ?";
+      // same effective-capacity rule as handleTop: the curated vram_mb override (0 = none)
+      // beats the envelope value, so backfilled rows land in their entity's drill-down
+      const VT = "CASE WHEN vram_mb IS NOT NULL THEN (CASE WHEN vram_mb > 0 THEN vram_mb END)"
+               + " ELSE CAST(json_extract(raw,'$.result.vram_total_mb') AS REAL) END";
+      where += ` AND ${VT} >= ? AND ${VT} < ?`;
       binds.push(b[0], b[1]);
     }
   }

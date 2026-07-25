@@ -34,6 +34,12 @@ CREATE TABLE IF NOT EXISTS submissions (
   -- publish_now = 1 → an admin overrode the publication hold (or approved a flagged row), so
   -- the row shows immediately instead of waiting out the hold window.
   publish_now INTEGER NOT NULL DEFAULT 0,
+  -- vram_mb: CURATED VRAM-capacity override. The measured value stays in the raw envelope
+  -- (audit record — never rewritten); this column is for one-off curation of historical rows:
+  -- pre-instrumentation Intel Arc rows backfilled where the model ships exactly one capacity
+  -- (A380=6144 etc.), and 0 to SUPPRESS a bogus value (AMD APU shared-RAM carve-outs misread
+  -- as VRAM). NULL = no override, read the envelope. New clients self-report.
+  vram_mb REAL,
   UNIQUE(install_id, gpu, profile, hw_variant)
 );
 CREATE INDEX IF NOT EXISTS idx_sub_profile ON submissions(profile, hidden);
