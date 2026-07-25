@@ -1037,6 +1037,72 @@ class TestBarVram(unittest.TestCase):
         self.assertIsNone(benchmark.parse_bar_vram_mb(io))
 
 
+def _pack_xe_regions(regions):
+    """Build a drm_xe_query_mem_regions blob: header (num, pad) + 88-byte regions
+    (mem_class, instance, min_page_size, total_size, used, cpu_visible_size,
+    cpu_visible_used, reserved[6])."""
+    import struct as st
+    out = st.pack("<II", len(regions), 0)
+    for cls, total, used in regions:
+        out += st.pack("<HHIQQQQ", cls, 0, 4096, total, used, total, used) + b"\0" * 48
+    return out
+
+
+def _pack_i915_regions(regions):
+    """Build a drm_i915_query_memory_regions blob: header (num, rsvd[3]) + 88-byte
+    region infos (class, instance, rsvd0, probed_size, unallocated_size, union[64])."""
+    import struct as st
+    out = st.pack("<IIII", len(regions), 0, 0, 0)
+    for cls, probed, unalloc in regions:
+        out += st.pack("<HHIQQ", cls, 0, 0, probed, unalloc) + b"\0" * 64
+    return out
+
+
+class TestDrmMemRegions(unittest.TestCase):
+    """Exact VRAM totals come from the drivers' memory-region query ioctls (what nvtop uses),
+    NOT the PCI BAR: BARs are power-of-2 windows, so a 6 GB A380 exposes an 8 GiB BAR and a
+    12 GB B580 a 16 GiB one — found live when a real A380 submitted 8192 MB. The parsers here
+    decode the query blobs; class 1 = VRAM/device-local, class 0 = system memory."""
+    GIB = 1024 ** 3
+
+    def test_xe_vram_region(self):
+        blob = _pack_xe_regions([(0, 64 * self.GIB, 0),               # sysmem — ignored
+                                 (1, 16304 * 1024 * 1024, 2 * self.GIB)])  # the B50's real total
+        total, used = benchmark.parse_xe_mem_regions(blob)
+        self.assertEqual(total, 16304.0)
+        self.assertEqual(used, 2048.0)
+
+    def test_xe_igpu_no_vram(self):
+        total, used = benchmark.parse_xe_mem_regions(_pack_xe_regions([(0, 64 * self.GIB, 0)]))
+        self.assertIsNone(total)
+        self.assertIsNone(used)
+
+    def test_xe_multi_tile_sums(self):
+        blob = _pack_xe_regions([(1, 8 * self.GIB, self.GIB), (1, 8 * self.GIB, self.GIB)])
+        total, used = benchmark.parse_xe_mem_regions(blob)
+        self.assertEqual(total, 16384.0)
+        self.assertEqual(used, 2048.0)
+
+    def test_xe_garbage(self):
+        self.assertEqual(benchmark.parse_xe_mem_regions(b""), (None, None))
+        self.assertEqual(benchmark.parse_xe_mem_regions(b"\x01"), (None, None))
+
+    def test_i915_device_region(self):
+        # A380: 6 GB probed, 5 GB unallocated -> used = probed - unallocated
+        blob = _pack_i915_regions([(0, 32 * self.GIB, 32 * self.GIB),
+                                   (1, 6 * self.GIB, 5 * self.GIB)])
+        total, used = benchmark.parse_i915_mem_regions(blob)
+        self.assertEqual(total, 6144.0)
+        self.assertEqual(used, 1024.0)
+
+    def test_i915_igpu_system_only(self):
+        blob = _pack_i915_regions([(0, 32 * self.GIB, 30 * self.GIB)])
+        self.assertEqual(benchmark.parse_i915_mem_regions(blob), (None, None))
+
+    def test_i915_garbage(self):
+        self.assertEqual(benchmark.parse_i915_mem_regions(b""), (None, None))
+
+
 class TestVramCapable(unittest.TestCase):
     """Which devices get VRAM accounting: NVIDIA/AMD dGPUs + Intel Arc dGPUs (xe/i915 fdinfo).
     iGPUs and the CPU share system RAM — nothing to track."""

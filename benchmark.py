@@ -27,6 +27,8 @@ import shlex
 import threading
 import subprocess
 import hashlib
+import struct
+import fcntl
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -94,7 +96,7 @@ DYNAMIX_CFG     = _env("DYNAMIX_CFG", "/dynamix.cfg")  # optional RO mount of Un
 # will move to gpu.spaceinvader.one once the domain's DNS is on Cloudflare. Setting the env var
 # to empty/whitespace disables submission entirely (the Submit button never shows).
 SUBMIT_URL      = _env("SUBMIT_URL", "https://gpu.spaceinvader.one/api/submit").strip()
-TOOL_VERSION    = "1.4"
+TOOL_VERSION    = "1.5"
 
 # SMBIOS Memory Device "Memory Type" enum (subset)
 MEM_TYPE = {0x13: "DDR", 0x14: "DDR2", 0x18: "DDR3", 0x1A: "DDR4", 0x1E: "LPDDR",
@@ -2427,10 +2429,9 @@ def benchmark(gpu, codec="h264", input_codec="hevc", custom_path=None,
             if g0:
                 vram_total = round(g0[1], 1)
             elif gpu.get("vendor") == "intel":
-                # xe exposes no container-readable global used/total — total comes from the
-                # PCI BAR (spans the whole VRAM on ReBAR cards; None on a legacy aperture).
-                # free_start stays None: co-tenant usage is invisible, and an honest None
-                # beats pretending the card started empty.
+                # the DRM query in gpu_mem_global failed — fall back to the PCI BAR for the
+                # total (exact on power-of-2 cards, +1 bucket otherwise); free_start stays
+                # None, an honest None beats pretending the card started empty
                 vram_total = arc_vram_total_mb(gpu.get("pci"))
         vram_free_start = round(g0[1] - g0[0], 1) if g0 else None
         ramp_max = MAX_STREAMS if mode == "streaming" else CONV_MAX_STREAMS
@@ -3372,6 +3373,12 @@ def gpu_mem_global(gpu):
             total = _read(f"/sys/class/drm/{base}/device/mem_info_vram_total")
             if used and total:
                 return int(used) / 1048576.0, int(total) / 1048576.0
+        if gpu["vendor"] == "intel":
+            # Arc dGPU: exact totals from the driver's memory-region query (xe also reports
+            # global used, i915 derives it) — same figures nvtop shows
+            total, used = drm_vram_info(gpu["device"], gpu.get("kernel_driver"))
+            if total:
+                return (used or 0.0), total
     except Exception:
         pass
     return None
@@ -3420,8 +3427,98 @@ def _amd_telemetry(gpu, gen):
         _TELE_STOP.wait(1.0)
 
 
+def parse_xe_mem_regions(data):
+    """Decode a drm_xe_query_mem_regions blob: (num, pad) header + 88-byte regions of
+    (mem_class u16, instance u16, min_page_size u32, total_size u64, used u64,
+    cpu_visible_size u64, cpu_visible_used u64, reserved[6]). Class 1 = VRAM; multiple
+    VRAM regions (multi-tile) sum. Returns (total_mb, used_mb) or (None, None)."""
+    try:
+        num, _pad = struct.unpack_from("<II", data, 0)
+        total = used = 0
+        for i in range(num):
+            cls, _inst, _pg, tsz, usz, _cv, _cvu = struct.unpack_from("<HHIQQQQ", data, 8 + i * 88)
+            if cls == 1:                                   # DRM_XE_MEM_REGION_CLASS_VRAM
+                total += tsz
+                used += usz
+        if total:
+            return round(total / 1048576.0, 1), round(used / 1048576.0, 1)
+    except (struct.error, TypeError):
+        pass
+    return None, None
+
+
+def parse_i915_mem_regions(data):
+    """Decode a drm_i915_query_memory_regions blob: (num, rsvd[3]) header + 88-byte region
+    infos of (memory_class u16, memory_instance u16, rsvd0 u32, probed_size u64,
+    unallocated_size u64, union[64]). Class 1 = device-local (VRAM on Alchemist dGPUs);
+    used = probed - unallocated. Returns (total_mb, used_mb) or (None, None)."""
+    try:
+        num = struct.unpack_from("<I", data, 0)[0]
+        total = used = 0
+        for i in range(num):
+            cls, _inst, _r0, probed, unalloc = struct.unpack_from("<HHIQQ", data, 16 + i * 88)
+            if cls == 1:                                   # I915_MEMORY_CLASS_DEVICE
+                total += probed
+                used += max(probed - unalloc, 0)
+        if total:
+            return round(total / 1048576.0, 1), round(used / 1048576.0, 1)
+    except (struct.error, TypeError):
+        pass
+    return None, None
+
+
+def _drm_iowr(nr, size):
+    """Encode a DRM read-write ioctl request number (dir=RW, type 'd')."""
+    return (3 << 30) | (size << 16) | (0x64 << 8) | nr
+
+
+def drm_vram_info(dev, kernel_driver):
+    """(total_mb, used_mb) for an Intel dGPU straight from the driver's memory-region query
+    ioctl on the render node — the interface nvtop uses, EXACT for every capacity. This
+    replaced the PCI-BAR heuristic: BARs are power-of-2 windows, so a 6 GB A380 exposed an
+    8 GiB BAR and a 12 GB B580 would read 16 (found live via a real A380 submission).
+    Unprivileged, works in-container with just the /dev/dri passthrough. (None, None) when
+    the query fails — callers fall back to the BAR, which stays exact for pow2 cards."""
+    import ctypes
+    fd = None
+    try:
+        fd = os.open(dev, os.O_RDWR)
+        if kernel_driver == "xe":
+            # DRM_IOCTL_XE_DEVICE_QUERY (nr 0x40): two-call — size probe, then fill
+            q = bytearray(struct.pack("<QIIQQQ", 0, 1, 0, 0, 0, 0))   # query 1 = MEM_REGIONS
+            fcntl.ioctl(fd, _drm_iowr(0x40, 40), q)
+            size = struct.unpack_from("<I", q, 12)[0]
+            if not (0 < size <= 65536):
+                return None, None
+            buf = ctypes.create_string_buffer(size)
+            q = bytearray(struct.pack("<QIIQQQ", 0, 1, size, ctypes.addressof(buf), 0, 0))
+            fcntl.ioctl(fd, _drm_iowr(0x40, 40), q)
+            return parse_xe_mem_regions(buf.raw)
+        if kernel_driver == "i915":
+            # DRM_IOCTL_I915_QUERY (nr 0x79): item MEMORY_REGIONS (id 4), same two-call shape
+            item = ctypes.create_string_buffer(struct.pack("<QiIQ", 4, 0, 0, 0), 24)
+            hdr = bytearray(struct.pack("<IIQ", 1, 0, ctypes.addressof(item)))
+            fcntl.ioctl(fd, _drm_iowr(0x79, 16), hdr)
+            length = struct.unpack_from("<i", item.raw, 8)[0]
+            if not (0 < length <= 65536):
+                return None, None
+            buf = ctypes.create_string_buffer(length)
+            item = ctypes.create_string_buffer(
+                struct.pack("<QiIQ", 4, length, 0, ctypes.addressof(buf)), 24)
+            hdr = bytearray(struct.pack("<IIQ", 1, 0, ctypes.addressof(item)))
+            fcntl.ioctl(fd, _drm_iowr(0x79, 16), hdr)
+            return parse_i915_mem_regions(buf.raw)
+    except Exception:
+        pass
+    finally:
+        if fd is not None:
+            os.close(fd)
+    return None, None
+
+
 def arc_vram_total_mb(pci):
-    """Intel Arc VRAM total via the PCI BAR (see parse_bar_vram_mb). None when unknowable."""
+    """Intel Arc VRAM total via the PCI BAR (see parse_bar_vram_mb) — the FALLBACK when the
+    exact drm_vram_info query fails; right for power-of-2 cards, +1 bucket for the rest."""
     if not pci:
         return None
     return parse_bar_vram_mb(_read(f"/sys/bus/pci/devices/{pci}/resource"))
