@@ -367,9 +367,10 @@ async function handleTop(url, env) {
     const sess = row.capped && (row.limit_reason == null || row.limit_reason === "session");
     const k = entity + "|" + variant;
     if (!byKey.has(k)) byKey.set(k, { entity, base_gpu: row.gpu, ram_gen: gen, vram_gb: vram,
-      vendor: row.vendor, nvenc: variant, sessCount: 0, rows: [] });
+      vendor: row.vendor, nvenc: variant, sessCount: 0, hadVt: false, rows: [] });
     const g = byKey.get(k);
     if (sess) g.sessCount++;
+    if (vtEff != null) g.hadVt = true;   // any run actually carried a capacity reading
     g.rows.push({ ...row, clean: isClean(row) });
   }
 
@@ -391,6 +392,10 @@ async function handleTop(url, env) {
     const cappedMost = g.sessCount * 2 >= g.rows.length;   // majority session-capped
     return {
       gpu: g.entity, base_gpu: g.base_gpu, ram_gen: g.ram_gen, vram_gb: g.vram_gb, vendor: g.vendor,
+      // Intel dGPU rows submitted before the client measured VRAM (or from a GPU that doesn't
+      // report it) — the board can't show a capacity, and this explains why instead of leaving
+      // the bare name looking like a distinct product next to its "· 16 GB" sibling
+      vram_unrecorded: g.vendor === "intel" && !g.ram_gen && g.vram_gb == null && !g.hadVt,
       nvenc: g.nvenc,                            // ""|locked|unlocked|unknown → board badge
       session_capped: cappedMost,
       mostly_capped: cappedMost,
@@ -630,6 +635,7 @@ tr.detail>td{background:#0a111d;padding:18px 22px}
 .lbadge.memory{background:#301a34;color:#c77dff}.lbadge.unknown{background:#3a1414;color:#ff7675}
 .lock{display:inline-block;font-size:10px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;border-radius:5px;padding:1px 6px;margin-left:8px;vertical-align:middle}
 .lock.unl{background:#123524;color:#2ecc71}.lock.lok{background:#2a2f3a;color:#9fb3c8}
+.lock.vrun{background:#1c2433;color:#7b8aa0;cursor:help}
 .ramrow{display:flex;justify-content:space-between;font-size:14px;padding:5px 0;border-bottom:1px solid #141d2c}
 .ramrow:last-child{border-bottom:none}.ramrow b{font-variant-numeric:tabular-nums}
 .ramnote{font-size:12px;color:var(--muted);margin-top:8px;line-height:1.45}
@@ -1013,7 +1019,9 @@ function renderRows(){
   tb.innerHTML=shown.map((r,i)=>{
     const cnt = r.understated ? (r.count+' run'+(r.count>1?'s':'')) : (r.clean_count+' clean run'+(r.clean_count>1?'s':''));
     return '<tr class="gpurow'+(i===0?' top':'')+'" data-gpu="'+esc(r.base_gpu)+'" data-gen="'+esc(r.ram_gen||"")+'" data-hw="'+esc(r.nvenc||"")+'" data-vram="'+esc(String(r.vram_gb||""))+'"><td class="rank">'+(i+1)+'</td>'
-      +'<td class="gpu"><span class="chev">▸</span>'+esc(r.gpu)+lockBadge(r.nvenc)+'<div class="v">'+esc(r.vendor||"")+'</div></td>'
+      +'<td class="gpu"><span class="chev">▸</span>'+esc(r.gpu)+lockBadge(r.nvenc)
+      +(r.vram_unrecorded?'<span class="lock vrun" data-tip="These runs came from a version of the benchmark that did not yet measure video memory (or a GPU that does not report it), so the capacity cannot be shown. Updating the container and re-running fills it in.">VRAM not recorded</span>':'')
+      +'<div class="v">'+esc(r.vendor||"")+'</div></td>'
       +'<td class="num"><span class="big">'+r.median_streams+'</span>'
       +' <span class="ccount">('+cnt+')'+(r.provisional?' <span class="prov">provisional</span>':'')+'</span>'
       +(r.count>1&&r.min_streams!==r.best_streams?' <span class="range">('+r.min_streams+'–'+r.best_streams+')</span>':'')

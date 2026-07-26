@@ -96,7 +96,7 @@ DYNAMIX_CFG     = _env("DYNAMIX_CFG", "/dynamix.cfg")  # optional RO mount of Un
 # will move to gpu.spaceinvader.one once the domain's DNS is on Cloudflare. Setting the env var
 # to empty/whitespace disables submission entirely (the Submit button never shows).
 SUBMIT_URL      = _env("SUBMIT_URL", "https://gpu.spaceinvader.one/api/submit").strip()
-TOOL_VERSION    = "1.5"
+TOOL_VERSION    = "1.6"
 
 # SMBIOS Memory Device "Memory Type" enum (subset)
 MEM_TYPE = {0x13: "DDR", 0x14: "DDR2", 0x18: "DDR3", 0x1A: "DDR4", 0x1E: "LPDDR",
@@ -760,6 +760,25 @@ def _pci_link_unknown(pci):
     card reports a real speed). Unreadable counts as unknown → treated as integrated."""
     v = (_read(f"/sys/bus/pci/devices/{pci}/current_link_speed") or "").strip()
     return (not v) or v.lower().startswith("unknown")
+
+
+def format_pci_id(vendor_txt, device_txt):
+    """"0x8086" + "0xe212" -> "8086:e212" — the exact silicon id, immune to a stale pci.ids
+    name database. None when either half is missing or malformed."""
+    m1 = re.fullmatch(r"0x([0-9a-fA-F]{4})", (vendor_txt or "").strip())
+    m2 = re.fullmatch(r"0x([0-9a-fA-F]{4})", (device_txt or "").strip())
+    return f"{m1.group(1).lower()}:{m2.group(1).lower()}" if (m1 and m2) else None
+
+
+def pci_device_id(pci):
+    """The PCI vendor:device id from sysfs. Carried in the result payload as dormant curation
+    evidence — the board never uses it automatically (no maintained GPU table), but a human
+    can resolve exactly which silicon a generically named row was ("Battlemage G21 [Intel
+    Graphics]": B50 or B60?), whatever the image's pci.ids knew at the time."""
+    if not pci:
+        return None
+    return format_pci_id(_read(f"/sys/bus/pci/devices/{pci}/vendor"),
+                         _read(f"/sys/bus/pci/devices/{pci}/device"))
 
 
 def _pci_name(pci_addr):
@@ -1597,7 +1616,8 @@ def detect_gpus():
         if os.path.islink(dl):
             kdrv = os.path.basename(os.path.realpath(dl))
         gpus.append({"vendor": vendor, "api": "vaapi", "name": name, "device": node,
-                     "pci": pci, "driver": "iHD" if vendor == "intel" else "radeonsi",
+                     "pci": pci, "pci_id": pci_device_id(pci),
+                     "driver": "iHD" if vendor == "intel" else "radeonsi",
                      "kernel_driver": kdrv,
                      "available": True, "note": None, "is_igpu": is_igpu})
 
@@ -2289,6 +2309,8 @@ def _build_result(gpu, codec, confirmed_max, single, peak_combined, per_level,
         "vendor": gpu["vendor"], "gpu": gpu["name"], "api": gpu["api"],
         "custom_source": custom_source,   # local-only: never leaderboard-eligible
         "driver": gpu.get("driver"), "kernel_driver": gpu.get("kernel_driver"),
+        # exact silicon id (VAAPI devices) — dormant curation evidence, see pci_device_id
+        "pci_id": gpu.get("pci_id"),
         # NVIDIA session-cap patch state (True/False/None) — the locked/unlocked board split
         "nvenc_unlocked": gpu.get("nvenc_unlocked"),
         "max_sustained": confirmed_max, "capped": capped, "projected": projected,

@@ -1058,6 +1058,25 @@ def _pack_i915_regions(regions):
     return out
 
 
+class TestPciId(unittest.TestCase):
+    """pci_id ("8086:e212") rides in the result payload as dormant evidence: the exact silicon
+    id, immune to a stale pci.ids name database, so future curation questions ("is that generic
+    'Battlemage G21' a B50 or a B60?") are answerable from data instead of inference."""
+    def test_formats_vendor_device(self):
+        self.assertEqual(benchmark.format_pci_id("0x8086\n", "0xe212\n"), "8086:e212")
+
+    def test_amd(self):
+        self.assertEqual(benchmark.format_pci_id("0x1002", "0x744c"), "1002:744c")
+
+    def test_missing_returns_none(self):
+        self.assertIsNone(benchmark.format_pci_id(None, "0xe212"))
+        self.assertIsNone(benchmark.format_pci_id("0x8086", None))
+        self.assertIsNone(benchmark.format_pci_id("", ""))
+
+    def test_garbage_returns_none(self):
+        self.assertIsNone(benchmark.format_pci_id("banana", "0xe212"))
+
+
 class TestDrmMemRegions(unittest.TestCase):
     """Exact VRAM totals come from the drivers' memory-region query ioctls (what nvtop uses),
     NOT the PCI BAR: BARs are power-of-2 windows, so a 6 GB A380 exposes an 8 GiB BAR and a
