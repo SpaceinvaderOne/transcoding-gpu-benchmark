@@ -396,6 +396,9 @@
         <span class="cmuted" id="subsnote"></span>
       </label>
     </div>
+    <div class="codecrow" id="hdrrow" style="display:none"><span class="crlabel" title="The HDR source can be tone-mapped down to SDR (the heaviest job a media server does) or kept as HDR10 - just downscaled, 10-bit end to end. Keeping HDR needs an HEVC or AV1 output; H.264 can't carry HDR10. Each choice is its own leaderboard profile.">HDR handling</span>
+      <select id="hdrsel" onchange="selectHdrOut(this.value)"></select>
+    </div>
     <div id="advnote"></div>
     <div id="clipsrow" style="display:none">
       <div class="customhead">Test clips <span class="cmuted" id="clipsnote"></span></div>
@@ -649,6 +652,7 @@ function renderScreens(s, vendor){
     renderInput(s);
     renderCodec(s);
     renderSubs(s);
+    renderHdr(s);
     renderClips(s);
     renderCustom(s);
     renderNote(s);
@@ -918,7 +922,7 @@ function renderInput(s){
   const sr2 = s.selected_source_res || "4k";
   const shipped = ((s.source_codecs_by_res||{})[sr2]) || ["hevc"];
   const srcOpts = shipped.map(c => (g.decodes||[]).indexOf(c)>=0 ? {v:c}
-    : {v:c, dis:true, why:(c==="hdr"?"can't tone-map":"can't decode")});
+    : {v:c, dis:true, why:(c==="hdr"?"can't process HDR":"can't decode")});
   fillSel("inputc", srcOpts, s.selected_input, c=>CODEC_LABEL[c]||c);
   fillSel("sres", s.source_res_options||["4k"], s.selected_source_res||"4k", r=>RES_LABEL[r]||r);
 }
@@ -928,8 +932,14 @@ function renderCodec(s){
   const g = (s.gpus||[]).find(x=>x.idx===s.selected_idx);
   if(!g){ row.style.display="none"; return; }
   row.style.display="flex";
-  const outOpts = ["h264","hevc","av1"].map(c => (g.codecs||["h264"]).indexOf(c)>=0 ? {v:c}
-    : {v:c, dis:true, why:"can't encode"});
+  const keep = !!s.selected_hdr_out && s.selected_input === "hdr";
+  const outOpts = ["h264","hevc","av1"].map(c => {
+    if(keep){                       // keep-HDR: 10-bit HEVC/AV1 only - H.264 can't carry HDR10
+      if(c === "h264") return {v:c, dis:true, why:"can't carry HDR10"};
+      return (g.hdr_pass||[]).indexOf(c)>=0 ? {v:c} : {v:c, dis:true, why:"can't 10-bit encode"};
+    }
+    return (g.codecs||["h264"]).indexOf(c)>=0 ? {v:c} : {v:c, dis:true, why:"can't encode"};
+  });
   fillSel("codec", outOpts, s.selected_codec, c=>CODEC_LABEL[c]||c);
   const sr = s.selected_source_res||"4k";
   fillSel("tres", (s.target_res_by_source||{})[sr]||["1080p"], s.selected_target_res||"1080p", r=>RES_LABEL[r]||r);
@@ -960,6 +970,23 @@ function renderClips(s){
   }
 }
 function selectSubs(on){ post("/subs?b="+(on?1:0)); }
+function selectHdrOut(v){ post("/hdrout?b="+(v==="keep"?1:0)); }
+function renderHdr(s){
+  // HDR handling: tone-map to SDR vs keep HDR10 (issue #4). Only for the HDR source; each
+  // option gated by its own probe - AMD/Mesa can't tone-map but CAN keep HDR, so it shows
+  // keep-only. The backend re-validates everything at /hdrout and /start.
+  const row = document.getElementById("hdrrow");
+  const g = (s.gpus||[]).find(x=>x.idx===s.selected_idx);
+  const hdr = s.selected_input === "hdr" && !s.selected_custom;
+  if(!g || !hdr){ row.style.display="none"; return; }
+  row.style.display = "flex";
+  const canKeep = (g.hdr_pass||[]).length > 0;
+  const opts = [
+    g.tonemap ? {v:"sdr"} : {v:"sdr", dis:true, why:"can't tone-map"},
+    canKeep ? {v:"keep"} : {v:"keep", dis:true, why:"can't 10-bit encode"}];
+  fillSel("hdrsel", opts, s.selected_hdr_out ? "keep" : "sdr",
+          v => v==="keep" ? "Keep HDR (HDR10)" : "Tone-map to SDR");
+}
 function renderSubs(s){
   // burn-in toggle: streaming-mode realism modifier. Hidden in convert mode; disabled for the
   // HDR source (combined tone-map + burn chain is unsupported in v1 — the backend enforces it).
@@ -1000,7 +1027,8 @@ function renderMode(s){
   document.getElementById("sresfixed").style.display = conv ? "none" : "";
   document.getElementById("tresfixed").style.display = conv ? "none" : "";
   const hdrIn = s.selected_input === "hdr";
-  const extras = (hdrIn ? " · HDR→SDR tone-mapped" : "") + (s.selected_subs ? " · subs burned in" : "");
+  const extras = (hdrIn ? (s.selected_hdr_out ? " · HDR10 kept" : " · HDR→SDR tone-mapped") : "")
+    + (s.selected_subs ? " · subs burned in" : "");
   document.getElementById("rdesc").innerHTML = conv
     ? "Re-encode speed for any codec/resolution — per-file time + best worker count"
     : (s.selected_custom
@@ -1363,7 +1391,7 @@ function profOfResult(r){
   const srcPart = r.custom_source ? (srcL+" (your file)") : (srcRes+" "+srcL);
   return {srcPart, tgtRes, outL,
     prof: srcPart + " → " + tgtRes + " " + outL
-      + (inC==="hdr" ? " (tone-mapped)" : "") + (r.subs_burn ? " + subs burned in" : "")
+      + (inC==="hdr" ? (r.hdr_out ? " (HDR10 kept)" : " (tone-mapped)") : "") + (r.subs_burn ? " + subs burned in" : "")
       + (r.clip_verified===false ? " · locally generated clip — local-only" : "")};
 }
 function specLineR(r){

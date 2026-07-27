@@ -68,7 +68,8 @@ const CLIP_SHA = {
 // profile_label(); comparable runs are always 4K→1080p non-custom, so no custom/res variants)
 function expectedProfile(r) {
   return "4K " + String(r.input_codec).toUpperCase() + " -> 1080p "
-    + String(r.codec).toUpperCase() + (r.subs_burn ? " + subs" : "");
+    + String(r.codec).toUpperCase() + (r.hdr_out === true ? " (HDR10)" : "")
+    + (r.subs_burn ? " + subs" : "");
 }
 
 // NVIDIA NVENC session-cap patch state → the board's locked/unlocked IDENTITY axis (so a locked
@@ -138,6 +139,11 @@ function validate(env0) {
   if (!VENDORS.includes(r.vendor)) return "unknown vendor";
   if (!OUT_CODECS.includes(r.codec)) return "unknown output codec";
   if (r.ten_bit === true) return "10-bit output is not a comparable profile";  // 4K→1080p is 8-bit
+  // keep-HDR (HDR10 passthrough, issue #4): its own boards; 10-bitness is implied by hdr_out
+  // (ten_bit stays false). Coherence: HDR source only, and H.264 can't carry HDR10.
+  if (r.hdr_out !== undefined && typeof r.hdr_out !== "boolean") return "bad hdr_out";
+  if (r.hdr_out === true && (r.input_codec !== "hdr" || !["hevc", "av1"].includes(r.codec)))
+    return "hdr_out incoherent";
   if (typeof r.gpu !== "string" || !r.gpu.length || r.gpu.length > 120) return "bad gpu";
   // profile must equal the string DERIVED from the validated fields — no invented boards
   if (r.profile !== expectedProfile(r)) return "profile does not match run parameters";
@@ -901,16 +907,16 @@ function toggleView(){
 // Safe to parse: the server DERIVES/validates every stored profile string from structured
 // fields, so the format is a guarantee, not a convention.
 let PROFILES=[];                                          // [{profile,count,src,out,subs}]
-let SEL={src:"HEVC",out:"H264",subs:false};
+let SEL={src:"HEVC",out:"H264",subs:false,hdr10:false};
 const SRC_ORDER=["HEVC","AV1","H264","HDR"], OUT_ORDER=["H264","HEVC","AV1"];
 const SRC_NICE={HEVC:"4K HEVC",AV1:"4K AV1",H264:"4K H264",HDR:"4K HDR"};
 function parseProf(p){
-  const m=/^4K (\\w+) -> 1080p (\\w+)( \\+ subs)?$/.exec(p);
-  return m?{src:m[1],out:m[2],subs:!!m[3]}:null;
+  const m=/^4K (\\w+) -> 1080p (\\w+)( \\(HDR10\\))?( \\+ subs)?$/.exec(p);
+  return m?{src:m[1],out:m[2],hdr10:!!m[3],subs:!!m[4]}:null;
 }
-function profOf(s){return "4K "+s.src+" -> 1080p "+s.out+(s.subs?" + subs":"");}
-function pcount(src,out,subs){
-  const f=PROFILES.find(p=>p.src===src&&p.out===out&&p.subs===subs);
+function profOf(s){return "4K "+s.src+" -> 1080p "+s.out+(s.hdr10?" (HDR10)":"")+(s.subs?" + subs":"");}
+function pcount(src,out,subs,hdr10){
+  const f=PROFILES.find(p=>p.src===src&&p.out===out&&p.subs===subs&&!!p.hdr10===!!hdr10);
   return f?f.count:0;
 }
 function srcTotal(src){return PROFILES.filter(p=>p.src===src).reduce((t,p)=>t+p.count,0);}
@@ -931,6 +937,12 @@ function renderPills(){
   }).join("");
   const sn=pcount(SEL.src,SEL.out,true);
   if(sn) html+='<button class="prof subs'+(SEL.subs?' on':'')+'" data-subs="1">+ subtitles<small>'+sn+'</small></button>';
+  // keep-HDR boards (HDR source only): each populated "<codec> (HDR10)" is its own pill
+  OUT_ORDER.forEach(o=>{
+    const hn=pcount(SEL.src,o,false,true);
+    if(hn) html+='<button class="prof'+(SEL.out===o&&SEL.hdr10?' on':'')+'" data-o="'+o+'" data-hdr10="1">'
+      +(CODEC_NICE[o]||o)+' (HDR10)<small>'+hn+'</small></button>';
+  });
   outEl.innerHTML=html;
   srcEl.querySelectorAll("[data-s]").forEach(b=>b.addEventListener("click",()=>{
     SEL.src=b.dataset.s;
@@ -938,11 +950,13 @@ function renderPills(){
     if(!(pcount(SEL.src,SEL.out,false)>0||(SEL.src==="HEVC"&&SEL.out==="H264")))
       SEL.out=OUT_ORDER.find(o=>pcount(SEL.src,o,false)>0)||"H264";
     if(SEL.subs&&!pcount(SEL.src,SEL.out,true)) SEL.subs=false;
+    if(SEL.hdr10&&!pcount(SEL.src,SEL.out,false,true)) SEL.hdr10=false;
     applySel();
   }));
   outEl.querySelectorAll("[data-o]").forEach(b=>b.addEventListener("click",()=>{
     SEL.out=b.dataset.o;
     SEL.subs=false;                        // a plain output pill selects the non-subs board
+    SEL.hdr10=!!b.dataset.hdr10;           // "(HDR10)" pills select the keep-HDR board
     applySel();
   }));
   const sb=outEl.querySelector("[data-subs]");
@@ -1058,7 +1072,7 @@ fetch("/api/profiles").then(r=>r.json()).then(d=>{
   if(st&&total>0) st.innerHTML='<b>'+total.toLocaleString()+'</b> results and counting';
   PROFILES=(d.profiles||[]).map(p=>{
     const ps=parseProf(p.profile);
-    return ps?{profile:p.profile,count:p.count||0,src:ps.src,out:ps.out,subs:ps.subs}:null;
+    return ps?{profile:p.profile,count:p.count||0,src:ps.src,out:ps.out,subs:ps.subs,hdr10:ps.hdr10}:null;
   }).filter(Boolean);
   // the two-row navigation earns its place once there is any CHOICE beyond canonical
   const choices=new Set(PROFILES.filter(p=>p.count>0).map(p=>p.profile));

@@ -1212,10 +1212,90 @@ class TestHdrTonemap(unittest.TestCase):
         self.assertTrue(benchmark.clip_master("4k", "hdr").endswith("source_4k_hdr.mkv"))
 
     def test_batch_skip_reason_tone_map(self):
-        gpu = {"available": True, "decodes": ["h264", "hevc"], "codecs": ["h264"]}
+        # batch HDR jobs are tone-map jobs (v1) — gate on the tonemap FLAG, because "hdr" in
+        # decodes can now mean keep-HDR-only (AMD/Mesa can't tone-map but keeps HDR fine)
+        gpu = {"available": True, "decodes": ["h264", "hevc", "hdr"], "codecs": ["h264"],
+               "tonemap": False, "hdr_pass": ["hevc"]}
         self.assertEqual(benchmark.batch_skip_reason(gpu, "hdr", "h264"), "can't tone-map HDR")
-        gpu["decodes"].append("hdr")
+        gpu["tonemap"] = True
         self.assertIsNone(benchmark.batch_skip_reason(gpu, "hdr", "h264"))
+
+
+class TestHdrPassthrough(unittest.TestCase):
+    """Keep-HDR (HDR10 passthrough, issue #4): decode the 10-bit HDR source, downscale staying
+    p010, encode HEVC/AV1 main10 with BT.2020/PQ flags — NO tone-map stage in the chain. H.264
+    can't carry HDR10 so it must refuse. Tone-map chains stay byte-identical."""
+    VAAPI = {"api": "vaapi", "device": "/dev/dri/renderD129", "vendor": "intel"}
+    NVENC = {"api": "nvenc", "index": 0, "vendor": "nvidia"}
+    CPU = {"api": "software", "vendor": "cpu"}
+
+    def _vf(self, cmd):
+        return cmd[cmd.index("-vf") + 1]
+
+    def _tags(self, cmd):
+        return ("bt2020" in cmd and "smpte2084" in cmd and "bt2020nc" in cmd)
+
+    def test_vaapi_keep_hdr(self):
+        cmd = benchmark.transcode_cmd(self.VAAPI, "/x.mkv", "hevc", hdr=True, hdr_out=True)
+        vf = self._vf(cmd)
+        self.assertNotIn("tonemap", vf)
+        self.assertIn("scale_vaapi=w=1920:h=1080:format=p010", vf)
+        self.assertIn("hevc_vaapi", cmd)
+        self.assertIn("main10", cmd)
+        self.assertTrue(self._tags(cmd))
+        self.assertGreater(cmd.index("-noautoscale"), cmd.index("-i"))
+
+    def test_nvenc_keep_hdr(self):
+        cmd = benchmark.transcode_cmd(self.NVENC, "/x.mkv", "hevc", hdr=True, hdr_out=True)
+        vf = self._vf(cmd)
+        self.assertNotIn("tonemap", vf)
+        self.assertIn("scale_cuda=1920:1080:format=p010", vf)
+        self.assertIn("hevc_nvenc", cmd)
+        self.assertIn("main10", cmd)
+        self.assertTrue(self._tags(cmd))
+
+    def test_cpu_keep_hdr(self):
+        cmd = benchmark.transcode_cmd(self.CPU, "/x.mkv", "hevc", hdr=True, hdr_out=True)
+        vf = self._vf(cmd)
+        self.assertNotIn("tonemapx", vf)
+        self.assertIn("scale=1920:1080", vf)
+        self.assertIn("yuv420p10le", cmd)
+        self.assertIn("main10", cmd)
+        self.assertTrue(self._tags(cmd))
+
+    def test_av1_keep_hdr_no_main10_flag(self):
+        # AV1 Main takes 10-bit from p010 with no profile flag (matches the archival path)
+        cmd = benchmark.transcode_cmd(self.VAAPI, "/x.mkv", "av1", hdr=True, hdr_out=True)
+        self.assertIn("av1_vaapi", cmd)
+        self.assertNotIn("main10", cmd)
+        self.assertIn("format=p010", self._vf(cmd))
+        self.assertTrue(self._tags(cmd))
+
+    def test_h264_keep_hdr_refused(self):
+        with self.assertRaises(ValueError):
+            benchmark.transcode_cmd(self.VAAPI, "/x.mkv", "h264", hdr=True, hdr_out=True)
+
+    def test_keep_hdr_without_hdr_source_refused(self):
+        with self.assertRaises(ValueError):
+            benchmark.transcode_cmd(self.VAAPI, "/x.mkv", "hevc", hdr=False, hdr_out=True)
+
+    def test_tonemap_chain_unchanged(self):
+        # the SDR tone-map path must stay byte-identical: same filter, nv12, no colour tags
+        cmd = benchmark.transcode_cmd(self.VAAPI, "/x.mkv", "hevc", hdr=True)
+        self.assertIn("tonemap_vaapi=format=nv12", self._vf(cmd))
+        self.assertFalse(self._tags(cmd))
+
+    def test_profile_label_hdr10(self):
+        self.assertEqual(
+            benchmark.profile_label("4k", "hdr", "1080p", "hevc", False, False, False, True),
+            "4K HDR -> 1080p HEVC (HDR10)")
+        self.assertEqual(
+            benchmark.profile_label("4k", "hdr", "4k", "av1", False, False, False, True),
+            "4K HDR -> 4K AV1 (HDR10)")
+        # tone-map profile string unchanged
+        self.assertEqual(
+            benchmark.profile_label("4k", "hdr", "1080p", "hevc", False, False, False, False),
+            "4K HDR -> 1080p HEVC")
 
 
 class TestSubsBurnin(unittest.TestCase):

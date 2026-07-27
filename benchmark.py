@@ -96,7 +96,7 @@ DYNAMIX_CFG     = _env("DYNAMIX_CFG", "/dynamix.cfg")  # optional RO mount of Un
 # will move to gpu.spaceinvader.one once the domain's DNS is on Cloudflare. Setting the env var
 # to empty/whitespace disables submission entirely (the Submit button never shows).
 SUBMIT_URL      = _env("SUBMIT_URL", "https://gpu.spaceinvader.one/api/submit").strip()
-TOOL_VERSION    = "1.6"
+TOOL_VERSION    = "1.7"
 
 # SMBIOS Memory Device "Memory Type" enum (subset)
 MEM_TYPE = {0x13: "DDR", 0x14: "DDR2", 0x18: "DDR3", 0x1A: "DDR4", 0x1E: "LPDDR",
@@ -524,6 +524,7 @@ STATE = {
     "selected_target_res": "1080p",  # output resolution (4k|1080p|720p, <= source) — default 1080p
     "selected_mode": "streaming",  # streaming (how many at once) | convert (how fast)
     "selected_subs": False,       # burn the shipped subtitles in (streaming realism toggle)
+    "selected_hdr_out": False,    # keep HDR (HDR10 passthrough) instead of tone-mapping to SDR
     "clips": [],                  # canonical-clip cache states [{name,status,size_mb}]
     "clips_shipped": True,        # image bakes the clips in (transition) ⇒ hide the clips panel
     "clip_dl": None,              # live download progress {name,pct,mb,total_mb}
@@ -1136,9 +1137,13 @@ def batch_skip_reason(gpu, input_codec, codec):
     so exclusions are visible instead of devices silently missing."""
     if not gpu.get("available"):
         return "not testable"
-    if input_codec not in gpu.get("decodes", []):
-        # "hdr" in decodes means the tone-map probe passed, not plain HEVC decode
-        return "can't tone-map HDR" if input_codec == "hdr" else f"can't decode {input_codec.upper()}"
+    if input_codec == "hdr":
+        # batch HDR jobs run the tone-map profile (keep-HDR is a main-run option, not swept in
+        # v1) — and "hdr" in decodes may mean keep-HDR-only (AMD), so gate on the tone-map flag
+        if not gpu.get("tonemap"):
+            return "can't tone-map HDR"
+    elif input_codec not in gpu.get("decodes", []):
+        return f"can't decode {input_codec.upper()}"
     if codec not in gpu.get("codecs", []):
         return f"can't encode {codec.upper()}"
     return None
@@ -1185,13 +1190,17 @@ def build_batch_jobs(devices, kind, output_codec, subs_on, selected_input, sourc
     return jobs, skipped
 
 
-def profile_label(source_res, input_codec, target_res, codec, custom_source, subs, ten_bit):
-    """The human/leaderboard profile string, e.g. "4K HEVC -> 1080p H264 + subs". Every distinct
-    workload (input codec, HDR, burn-in, resolutions, bit depth) is its own profile so the board
-    buckets like-for-like automatically."""
+def profile_label(source_res, input_codec, target_res, codec, custom_source, subs, ten_bit,
+                  hdr_out=False):
+    """The human/leaderboard profile string, e.g. "4K HEVC -> 1080p H264 + subs" or
+    "4K HDR -> 1080p HEVC (HDR10)". Every distinct workload (input codec, HDR handling,
+    burn-in, resolutions, bit depth) is its own profile so the board buckets like-for-like
+    automatically. "(HDR10)" (codec first — Ed's naming) marks the keep-HDR output; the
+    tone-mapped-to-SDR profiles keep their original unsuffixed names."""
     src = (f"{input_codec.upper()} (your file)" if custom_source
            else f"{RES_LABEL[source_res]} {input_codec.upper()}")
-    tgt = f"{RES_LABEL[target_res]} {codec.upper()}" + (" 10-bit" if ten_bit else "")
+    tgt = (f"{RES_LABEL[target_res]} {codec.upper()}" + (" 10-bit" if ten_bit else "")
+           + (" (HDR10)" if hdr_out else ""))
     return f"{src} -> {tgt}" + (" + subs" if subs else "")
 
 
@@ -1572,6 +1581,37 @@ def tonemap_supported(gpu):
         return False
 
 
+def hdr_pass_supported(gpu, codec):
+    """Can this GPU KEEP HDR while downscaling (issue #4): 1-frame decode of the HDR probe
+    clip → 10-bit hw scale (p010) → main10 encode. Independent of tonemap_supported — the
+    whole point is that AMD/Mesa can't tone-map but CAN do this, so it joins the HDR boards
+    with keep-HDR only. Same never-silently-fall-back philosophy as every other probe."""
+    master = probe_clip("hdr")
+    if not master or codec not in ("hevc", "av1"):
+        return False
+    prof = ["-profile:v", "main10"] if codec == "hevc" else []
+    if gpu["api"] == "vaapi":
+        cmd = [FFMPEG, "-hide_banner", "-loglevel", "error",
+               "-hwaccel", "vaapi", "-hwaccel_device", gpu["device"],
+               "-hwaccel_output_format", "vaapi", "-i", master, "-frames:v", "1", "-an",
+               "-noautoscale",
+               "-vf", "scale_vaapi=w=1920:h=1080:format=p010le",
+               "-c:v", enc_name("vaapi", codec)] + prof + ["-f", "null", "-"]
+    else:  # nvenc/cuda
+        dev = ["-hwaccel_device", str(gpu["index"])] if gpu.get("index") is not None else []
+        cmd = [FFMPEG, "-hide_banner", "-loglevel", "error",
+               "-hwaccel", "cuda", "-hwaccel_output_format", "cuda"] + dev + \
+              ["-i", master, "-frames:v", "1", "-an", "-noautoscale",
+               "-vf", "scale_cuda=1920:1080:format=p010le",
+               "-c:v", enc_name("nvenc", codec)] + prof + ["-f", "null", "-"]
+    try:
+        r = subprocess.run(cmd, env=stream_env(gpu),
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
 def _nvidia_present_on_host():
     """True if an NVIDIA display GPU exists on the host (even without the runtime)."""
     try:
@@ -1652,22 +1692,31 @@ def detect_gpus():
             g["codecs"] = ["h264", "hevc", "av1"]
             g["decodes"] = ["h264", "hevc", "av1"]
             g["codecs10"] = ["hevc", "av1"]
-            if tonemap_supported(g):
+            g["tonemap"] = tonemap_supported(g)
+            g["hdr_pass"] = ["hevc", "av1"]      # software 10-bit is universal
+            if g["tonemap"] or g["hdr_pass"]:
                 g["decodes"].append("hdr")
         elif g["available"]:
             g["codecs"] = ["h264"] + [c for c in ("hevc", "av1") if codec_supported(g, c)]
             g["decodes"] = [c for c in INPUT_CODECS if decode_supported(g, c)] or ["hevc"]
-            # "hdr" = the HDR10 source option; offered only when the tone-map pipeline works
-            # (tonemap_vaapi is Intel-iHD-only in practice — AMD/Mesa is expected to sit out)
-            if "hevc" in g["decodes"] and tonemap_supported(g):
-                g["decodes"].append("hdr")
             # which output codecs can this GPU encode in 10-bit (for the 4K->4K archival case)
             g["codecs10"] = [c for c in ("hevc", "av1")
                              if c in g["codecs"] and codec_supported(g, c, ten_bit=True)]
+            # HDR handling is TWO independent capabilities: tone-map to SDR (tonemap_vaapi is
+            # Intel-iHD-only in practice) and keep-HDR (10-bit decode+scale+main10 encode —
+            # AMD/Mesa can't tone-map but CAN do this). The HDR source is offered when EITHER
+            # works; each output mode is gated by its own probe.
+            g["tonemap"] = "hevc" in g["decodes"] and tonemap_supported(g)
+            g["hdr_pass"] = ([c for c in g["codecs10"] if hdr_pass_supported(g, c)]
+                             if "hevc" in g["decodes"] else [])
+            if g["tonemap"] or g["hdr_pass"]:
+                g["decodes"].append("hdr")
         else:
             g["codecs"] = ["h264"]
             g["decodes"] = ["hevc"]
             g["codecs10"] = []
+            g["tonemap"] = False
+            g["hdr_pass"] = []
 
     for i, g in enumerate(gpus):
         g["idx"] = i
@@ -1682,7 +1731,9 @@ def public_gpus(gpus):
              "kernel_driver": g.get("kernel_driver"),
              "codecs": g.get("codecs", ["h264"]),
              "decodes": g.get("decodes", ["hevc"]),
-             "codecs10": g.get("codecs10", [])} for g in gpus]
+             "codecs10": g.get("codecs10", []),
+             "tonemap": g.get("tonemap", False),
+             "hdr_pass": g.get("hdr_pass", [])} for g in gpus]
 
 
 # --------------------------------------------------------------- ffmpeg stream
@@ -1800,39 +1851,52 @@ def cpu_preset_arg(codec, preset):
     return preset
 
 
+HDR10_TAGS = ["-color_primaries", "bt2020", "-color_trc", "smpte2084", "-colorspace", "bt2020nc"]
+
+
 def transcode_cmd(gpu, src, codec="h264", target_res="1080p", ten_bit=False, preset="veryfast",
-                  hdr=False, subs=False):
+                  hdr=False, subs=False, hdr_out=False):
     """Full transcode (decode + scale + encode), flat-out, looped, to null. On a GPU everything
     runs on the GPU; on the CPU device it's pure software (libx264/x265/svt-av1 at `preset`).
     Output resolution + bit depth selectable; 10-bit uses p010 surfaces (HEVC gets main10).
-    `hdr` adds the HDR10→SDR tone-map stage (per-vendor filter, output always SDR 8-bit);
+    `hdr` = the HDR10 source; by default it adds the HDR10→SDR tone-map stage (per-vendor
+    filter, output SDR 8-bit). `hdr_out` KEEPS the HDR instead (issue #4): no tone-map, the
+    scale stays 10-bit (p010), the encoder goes main10 and the output carries explicit
+    BT.2020/PQ colour flags — HEVC/AV1 only, H.264 can't carry HDR10.
     `subs` burns the shipped .ass subtitles in (hw download → CPU libass render → encoder — the
     realistic Plex/Jellyfin burn-in cost). Chains validated live incl. the -stream_loop seam."""
     if hdr and subs:
         raise ValueError("HDR + subtitle burn-in combined is not supported")
-    if hdr:
+    if hdr_out:
+        if not hdr:
+            raise ValueError("hdr_out only applies to the HDR source")
+        if codec == "h264":
+            raise ValueError("H.264 cannot carry HDR10")
+    if hdr and not hdr_out:
         ten_bit = False                          # tone-mapped output is SDR 8-bit by definition
     w, h = RES_DIMS.get(target_res, (1920, 1080))
     bitrate = OUTPUT_BITRATE_BY_RES.get(target_res, OUTPUT_BITRATE)
+    hdr_tags = HDR10_TAGS if hdr_out else []
 
     if gpu.get("vendor") == "cpu":
         base = [FFMPEG, "-hide_banner", "-loglevel", "error", "-nostats", "-stream_loop", "-1"]
-        if hdr:
+        if hdr and not hdr_out:
             vf = (f"tonemapx=tonemap=bt2390:t=bt709:m=bt709:p=bt709:format=yuv420p,"
                   f"scale={w}:{h}")
         elif subs:
             vf = f"scale={w}:{h},subtitles=filename={BURNIN_ASS}"
         else:
-            vf = f"scale={w}:{h}"
-        pix = ["-pix_fmt", "yuv420p10le" if (ten_bit and codec in ("hevc", "av1")) else "yuv420p"]
+            vf = f"scale={w}:{h}"                # keep-HDR: plain scale, 10-bit via -pix_fmt
+        ten = (ten_bit and codec in ("hevc", "av1")) or hdr_out
+        pix = ["-pix_fmt", "yuv420p10le" if ten else "yuv420p"]
         enc = ["-c:v", CPU_ENCODERS[codec], "-preset", cpu_preset_arg(codec, preset)]
-        if ten_bit and codec == "hevc":
+        if (ten_bit or hdr_out) and codec == "hevc":
             enc += ["-profile:v", "main10"]
         enc += ["-b:v", bitrate]
-        return (base + ["-i", src, "-an", "-vf", vf] + pix + enc
+        return (base + ["-i", src, "-an", "-vf", vf] + pix + enc + hdr_tags
                 + ["-f", "null", "-progress", "pipe:1", "-"])
 
-    fmt = "p010le" if ten_bit else "nv12"
+    fmt = "p010le" if (ten_bit or hdr_out) else "nv12"
     base = [FFMPEG, "-hide_banner", "-loglevel", "error", "-nostats", "-stream_loop", "-1"]
     # -noautoscale: stop ffmpeg auto-inserting a scale filter after scale_vaapi/scale_cuda. That
     # auto filter fails to re-initialise at the -stream_loop seam ("Impossible to convert between
@@ -1843,7 +1907,7 @@ def transcode_cmd(gpu, src, codec="h264", target_res="1080p", ten_bit=False, pre
     if gpu["api"] == "vaapi":
         dec = ["-hwaccel", "vaapi", "-hwaccel_device", gpu["device"],
                "-hwaccel_output_format", "vaapi"]
-        if hdr:
+        if hdr and not hdr_out:
             # tone-map at full 4K (matches Jellyfin's order), then scale — emits SDR nv12
             vf = (f"tonemap_vaapi=format=nv12:t=bt709:m=bt709:p=bt709,"
                   f"scale_vaapi=w={w}:h={h}")
@@ -1868,16 +1932,16 @@ def transcode_cmd(gpu, src, codec="h264", target_res="1080p", ten_bit=False, pre
             dec = ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
             if gpu.get("index") is not None:
                 dec += ["-hwaccel_device", str(gpu["index"])]
-            if hdr:
+            if hdr and not hdr_out:
                 vf = (f"tonemap_cuda=format=nv12:tonemap=bt2390:p=bt709:t=bt709:m=bt709,"
                       f"scale_cuda={w}:{h}")
             else:
                 vf = f"scale_cuda={w}:{h}:format={fmt}"
     enc = ["-c:v", enc_name(gpu["api"], codec)]
-    if ten_bit and codec == "hevc":
+    if (ten_bit or hdr_out) and codec == "hevc":
         enc += ["-profile:v", "main10"]          # AV1 Main handles 10-bit from p010 with no flag
     enc += ["-b:v", OUTPUT_BITRATE_BY_RES.get(target_res, OUTPUT_BITRATE)]
-    return (base + dec + ["-i", src, "-an"] + out_pre + ["-vf", vf] + enc
+    return (base + dec + ["-i", src, "-an"] + out_pre + ["-vf", vf] + enc + hdr_tags
             + ["-f", "null", "-progress", "pipe:1", "-"])
 
 
@@ -2079,9 +2143,9 @@ def stage_clip(source_res, input_codec, custom_path=None):
 
 
 def probe_gpu(gpu, src, codec="h264", target_res="1080p", ten_bit=False, preset="veryfast",
-              hdr=False, subs=False):
+              hdr=False, subs=False, hdr_out=False):
     """Quick 1-stream check the chosen pipeline actually transcodes. (ok, err_tail)."""
-    s = Stream(0, transcode_cmd(gpu, src, codec, target_res, ten_bit, preset, hdr, subs),
+    s = Stream(0, transcode_cmd(gpu, src, codec, target_res, ten_bit, preset, hdr, subs, hdr_out),
                env=stream_env(gpu))
     try:
         s.start()
@@ -2143,11 +2207,12 @@ def _aborted_level(streams):
 
 
 def run_level(gpu, src, codec, n, last_passing, target_res="1080p", ten_bit=False, preset="veryfast",
-              mode="streaming", hdr=False, subs=False):
+              mode="streaming", hdr=False, subs=False, hdr_out=False):
     """Run n fresh streams from the clip start; hold; measure.
     Returns dict: {worst, combined, cap (bool), power (mean W during hold or None)}."""
     env = stream_env(gpu)
-    streams = [Stream(i + 1, transcode_cmd(gpu, src, codec, target_res, ten_bit, preset, hdr, subs),
+    streams = [Stream(i + 1, transcode_cmd(gpu, src, codec, target_res, ten_bit, preset,
+                                           hdr, subs, hdr_out),
                       env=env)
                for i in range(n)]
     for s in streams:
@@ -2244,7 +2309,7 @@ def _build_result(gpu, codec, confirmed_max, single, peak_combined, per_level,
                   capped, projected, pwr, input_codec="hevc", custom_source=False,
                   source_res="4k", target_res="1080p", ten_bit=False,
                   mode="streaming", rec_workers=None, preset="veryfast", subs=False,
-                  clip_verified=True, clip_sha256=None):
+                  clip_verified=True, clip_sha256=None, hdr_out=False):
     """Assemble the structured result payload + efficiency.
     `pwr` = {idle, idle_pkg, one, one_pkg, peak, peak_pkg} (board + package watts).
     Returns (result, spw, power_estimated)."""
@@ -2286,7 +2351,7 @@ def _build_result(gpu, codec, confirmed_max, single, peak_combined, per_level,
     with TELE_LOCK:
         tele = dict(TELEMETRY)
     profile = profile_label(source_res, input_codec, target_res, codec,
-                            custom_source, subs, ten_bit)
+                            custom_source, subs, ten_bit, hdr_out)
     # only the canonical 4K->1080p STREAMING run on a real GPU (non-custom) at the STRICT
     # 1.0x threshold, decoding the VERIFIED pinned bitstream, is leaderboard-comparable
     comparable = is_run_comparable(mode, source_res, target_res, custom_source, is_cpu,
@@ -2302,7 +2367,8 @@ def _build_result(gpu, codec, confirmed_max, single, peak_combined, per_level,
         "vs_cpu": None, "cpu_baseline_missing": False,
         "profile": profile, "codec": codec, "input_codec": input_codec,
         "source_res": source_res, "target_res": target_res, "ten_bit": ten_bit,
-        "subs_burn": subs, "clip_verified": clip_verified, "clip_sha256": clip_sha256,
+        "subs_burn": subs, "hdr_out": hdr_out,
+        "clip_verified": clip_verified, "clip_sha256": clip_sha256,
         "comparable": comparable,
         "bitrate": OUTPUT_BITRATE_BY_RES.get(target_res, OUTPUT_BITRATE),
         "threshold": PASS_THRESHOLD,
@@ -2339,7 +2405,7 @@ def _publish_cancelled():
 
 def benchmark(gpu, codec="h264", input_codec="hevc", custom_path=None,
               source_res="4k", target_res="1080p", ten_bit=False, mode="streaming",
-              skip_busy_warn=False, announce_done=True, subs=False):
+              skip_busy_warn=False, announce_done=True, subs=False, hdr_out=False):
     """One full run. `skip_busy_warn` bypasses the interactive busy gate (test-all batches must
     not stall waiting for a click); `announce_done=False` keeps ui='running' at finalize so a
     batch doesn't flash the single-run verdict between devices (result is still published)."""
@@ -2418,9 +2484,9 @@ def benchmark(gpu, codec="h264", input_codec="hevc", custom_path=None,
             return
 
         preset = CPU_PRESETS.get(mode, "veryfast")   # only used by the CPU (software) device
-        hdr = input_codec == "hdr"                   # HDR source ⇒ the tone-map pipeline
+        hdr = input_codec == "hdr"                   # HDR source (tone-map, or keep via hdr_out)
         publish(phase="preparing", message=f"Probing {gpu['name']} ({gpu['api'].upper()}, {codec})…")
-        ok, err = probe_gpu(gpu, src, codec, target_res, ten_bit, preset, hdr, subs)
+        ok, err = probe_gpu(gpu, src, codec, target_res, ten_bit, preset, hdr, subs, hdr_out)
         if not ok:
             tail = (err or "").strip().splitlines()[-1:] or [""]
             publish(ui="error", phase="error",
@@ -2463,7 +2529,7 @@ def benchmark(gpu, codec="h264", input_codec="hevc", custom_path=None,
             if mode == "convert":
                 publish(conv_testing_n=n)        # live curve: mark this level "measuring…"
             res = run_level(gpu, src, codec, n, last_passing, target_res, ten_bit, preset, mode,
-                            hdr, subs)
+                            hdr, subs, hdr_out)
             if res.get("aborted"):
                 break
             worst, combined, cap = res["worst"], res["combined"], res["cap"]
@@ -2568,7 +2634,7 @@ def benchmark(gpu, codec="h264", input_codec="hevc", custom_path=None,
             gpu, codec, confirmed_max, single, peak_combined, per_level,
             capped, projected, pwr, input_codec, custom_source=bool(custom_path),
             source_res=source_res, target_res=target_res, ten_bit=ten_bit,
-            mode=mode, rec_workers=rec_workers, preset=preset, subs=subs,
+            mode=mode, rec_workers=rec_workers, preset=preset, subs=subs, hdr_out=hdr_out,
             clip_verified=(_STAGED_VERIFIED if not custom_path else True),
             clip_sha256=(_STAGED_SHA if not custom_path else None))
         result.update(vram_extra)
@@ -2678,21 +2744,26 @@ def select_gpu(idx):
             return False
         publish(selected_idx=idx, selected_name=g["name"],
                 selected_input="hevc", selected_codec="h264", selected_subs=False,
+                selected_hdr_out=False,
                 selected_source_res="4k", selected_target_res="1080p", message="Ready.")
         return True
 
 
 def select_codec(codec):
-    """Pick the output codec. Only when idle and ENCODE-supported by the selected GPU."""
+    """Pick the output codec. Only when idle and ENCODE-supported by the selected GPU (and,
+    with keep-HDR active, capable of carrying HDR10 — H.264 can't)."""
     with RUN_LOCK:
         with STATE_LOCK:
             cur = STATE.get("ui")
             idx = STATE.get("selected_idx")
+            hdr_out = bool(STATE.get("selected_hdr_out"))
         if cur != "idle":
             return False
         g = _gpu_by_idx(idx)
         if not g or codec not in g.get("codecs", ["h264"]):
             return False
+        if hdr_out and codec not in g.get("hdr_pass", []):
+            return False                    # keep-HDR needs a 10-bit HEVC/AV1 encode path
         publish(selected_codec=codec)
         return True
 
@@ -2712,9 +2783,47 @@ def select_input(codec):
                 or codec not in SOURCE_CODECS_BY_RES.get(sr, ("h264",))):
             return False
         if codec == "hdr":
-            publish(selected_input=codec, selected_subs=False)  # HDR + burn-in unsupported (v1)
+            # a keep-HDR-only card (AMD/Mesa: no tone-map) goes straight to keep-HDR — the
+            # tone-map default would be a combo the hardware can't run
+            keep = not g.get("tonemap") and bool(g.get("hdr_pass"))
+            kw = {"selected_input": codec, "selected_subs": False}   # HDR + burn-in unsupported
+            if keep:
+                kw["selected_hdr_out"] = True
+                if STATE.get("selected_codec") not in g.get("hdr_pass", []):
+                    kw["selected_codec"] = g["hdr_pass"][0]
+            publish(**kw)
         else:
-            publish(selected_input=codec)
+            publish(selected_input=codec, selected_hdr_out=False)   # keep-HDR is HDR-source-only
+        return True
+
+
+def select_hdr_out(on):
+    """Toggle keep-HDR (HDR10 passthrough) vs tone-map-to-SDR for the HDR source. Turning it
+    on needs a 10-bit HEVC/AV1 encode path (and switches an incompatible output codec to the
+    first capable one); turning it off needs the tone-map pipeline (a keep-HDR-only card like
+    AMD/Mesa can't go back to SDR)."""
+    with RUN_LOCK:
+        with STATE_LOCK:
+            cur = STATE.get("ui")
+            idx = STATE.get("selected_idx")
+            inp = STATE.get("selected_input", "hevc")
+            codec = STATE.get("selected_codec", "h264")
+        if cur != "idle" or inp != "hdr":
+            return False
+        g = _gpu_by_idx(idx)
+        if not g:
+            return False
+        if on:
+            if not g.get("hdr_pass"):
+                return False
+            kw = {"selected_hdr_out": True}
+            if codec not in g["hdr_pass"]:
+                kw["selected_codec"] = g["hdr_pass"][0]
+            publish(**kw)
+        else:
+            if not g.get("tonemap"):
+                return False
+            publish(selected_hdr_out=False)
         return True
 
 
@@ -2822,6 +2931,7 @@ def start_run():
             target_res = STATE.get("selected_target_res", "1080p")
             mode = STATE.get("selected_mode", "streaming")
             subs = bool(STATE.get("selected_subs"))
+            hdr_out = bool(STATE.get("selected_hdr_out"))
         if cur != "idle":
             return False
         if mode == "streaming":
@@ -2854,6 +2964,17 @@ def start_run():
             input_codec = "hevc"
         if input_codec == "hdr":
             subs = False                             # HDR + burn-in combined is unsupported (v1)
+        # keep-HDR coherence: HDR source only, never a custom file, and the codec must have a
+        # 10-bit encode path (else fall to the first capable one; no capable one ⇒ tone-map,
+        # and a card that can't tone-map either falls back to the plain HEVC source)
+        hdr_out = hdr_out and input_codec == "hdr" and not custom_path
+        if hdr_out and codec not in gpu.get("hdr_pass", []):
+            if gpu.get("hdr_pass"):
+                codec = gpu["hdr_pass"][0]
+            else:
+                hdr_out = False
+        if input_codec == "hdr" and not hdr_out and not gpu.get("tonemap"):
+            input_codec = "hevc"                     # can't tone-map and can't keep — bail safely
         # auto 10-bit only when preserving resolution from a 10-bit source AND the GPU can do it
         ten_bit = (ten_bit_output(source_res, target_res, input_codec, codec)
                    and codec in gpu.get("codecs10", []) and not custom_path)
@@ -2863,11 +2984,11 @@ def start_run():
         publish(ui="preparing", phase="preparing", selected_idx=gpu["idx"],
                 selected_name=gpu["name"], selected_codec=codec, selected_input=input_codec,
                 selected_source_res=source_res, selected_target_res=target_res,
-                selected_subs=subs, message="Starting…")
+                selected_subs=subs, selected_hdr_out=hdr_out, message="Starting…")
         threading.Thread(target=benchmark,
                          args=(gpu, codec, input_codec, custom_path, source_res, target_res,
                                ten_bit, mode),
-                         kwargs={"subs": subs},
+                         kwargs={"subs": subs, "hdr_out": hdr_out},
                          daemon=True).start()
         return True
 
@@ -3016,6 +3137,7 @@ def reset_run():
                 source_ready=source_ready(), encoder=None,
                 selected_custom=None,
                 selected_name=None, selected_input="hevc", selected_codec="h264",
+                selected_hdr_out=False,
                 selected_source_res="4k", selected_target_res="1080p",
                 vendor=None, driver=None,
                 kernel_driver=None,
@@ -3935,6 +4057,8 @@ class Handler(BaseHTTPRequestHandler):
             return select_custom(_query_str(p, "f") or "")
         if path == "/subs":
             return select_subs(_query_str(p, "b") == "1")
+        if path == "/hdrout":
+            return select_hdr_out(_query_str(p, "b") == "1")
         if path == "/fetchclips":
             return start_fetch_clips()
         if path == "/startall":                             # legacy route — current-kind batch
