@@ -96,7 +96,7 @@ DYNAMIX_CFG     = _env("DYNAMIX_CFG", "/dynamix.cfg")  # optional RO mount of Un
 # will move to gpu.spaceinvader.one once the domain's DNS is on Cloudflare. Setting the env var
 # to empty/whitespace disables submission entirely (the Submit button never shows).
 SUBMIT_URL      = _env("SUBMIT_URL", "https://gpu.spaceinvader.one/api/submit").strip()
-TOOL_VERSION    = "1.7"
+TOOL_VERSION    = "1.8"
 
 # SMBIOS Memory Device "Memory Type" enum (subset)
 MEM_TYPE = {0x13: "DDR", 0x14: "DDR2", 0x18: "DDR3", 0x1A: "DDR4", 0x1E: "LPDDR",
@@ -801,7 +801,7 @@ def _nvidia_smi_gpus():
     """List NVIDIA GPUs visible to the container (runtime present). [] otherwise."""
     try:
         out = subprocess.run(
-            ["nvidia-smi", "--query-gpu=index,name,driver_version", "--format=csv,noheader"],
+            ["nvidia-smi", "--query-gpu=index,name,driver_version,uuid", "--format=csv,noheader"],
             capture_output=True, text=True, timeout=8)
         if out.returncode != 0:
             return []
@@ -813,7 +813,8 @@ def _nvidia_smi_gpus():
             parts = [p.strip() for p in line.split(",")]
             idx, name = int(parts[0]), parts[1]
             drv = parts[2] if len(parts) > 2 else None
-            gpus.append({"index": idx, "name": name, "driver": drv})
+            uuid_ = parts[3] if len(parts) > 3 and parts[3].startswith("GPU-") else None
+            gpus.append({"index": idx, "name": name, "driver": drv, "uuid": uuid_})
         return gpus
     except Exception:
         return []
@@ -844,7 +845,7 @@ def codec_supported(gpu, codec, ten_bit=False):
         cmd = (common[:1] + ["-vaapi_device", gpu["device"]] + common[1:]
                + ["-vf", f"format={fmt},hwupload", "-c:v", enc] + prof + ["-f", "null", "-"])
     else:
-        dev = ["-gpu", str(gpu["index"])] if gpu.get("index") is not None else []
+        dev = _nv_dev(gpu, "-gpu")
         cmd = common + ["-vf", f"format={fmt}", "-c:v", enc] + prof + dev + ["-f", "null", "-"]
     try:
         r = subprocess.run(cmd, env=stream_env(gpu),
@@ -1523,7 +1524,7 @@ def decode_probe_cmd(gpu, master):
         return base + ["-hwaccel", "vaapi", "-hwaccel_device", gpu["device"],
                        "-hwaccel_output_format", "vaapi", "-i", master] + tail + \
                ["-vf", "scale_vaapi=w=64:h=64", "-f", "null", "-"]
-    dev = ["-hwaccel_device", str(gpu["index"])] if gpu.get("index") is not None else []
+    dev = _nv_dev(gpu, "-hwaccel_device")
     return base + ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"] + dev + \
            ["-i", master] + tail + ["-vf", "scale_cuda=64:64", "-f", "null", "-"]
 
@@ -1566,7 +1567,7 @@ def tonemap_supported(gpu):
                       "scale_vaapi=w=1920:h=1080",
                "-c:v", "h264_vaapi", "-f", "null", "-"]
     else:  # nvenc/cuda
-        dev = ["-hwaccel_device", str(gpu["index"])] if gpu.get("index") is not None else []
+        dev = _nv_dev(gpu, "-hwaccel_device")
         cmd = [FFMPEG, "-hide_banner", "-loglevel", "error",
                "-hwaccel", "cuda", "-hwaccel_output_format", "cuda"] + dev + \
               ["-i", master, "-frames:v", "1", "-an", "-noautoscale",
@@ -1598,7 +1599,7 @@ def hdr_pass_supported(gpu, codec):
                "-vf", "scale_vaapi=w=1920:h=1080:format=p010le",
                "-c:v", enc_name("vaapi", codec)] + prof + ["-f", "null", "-"]
     else:  # nvenc/cuda
-        dev = ["-hwaccel_device", str(gpu["index"])] if gpu.get("index") is not None else []
+        dev = _nv_dev(gpu, "-hwaccel_device")
         cmd = [FFMPEG, "-hide_banner", "-loglevel", "error",
                "-hwaccel", "cuda", "-hwaccel_output_format", "cuda"] + dev + \
               ["-i", master, "-frames:v", "1", "-an", "-noautoscale",
@@ -1667,7 +1668,7 @@ def detect_gpus():
         sigs = load_nvenc_sigs()
         for g in nv:
             gpus.append({"vendor": "nvidia", "api": "nvenc", "name": g["name"],
-                         "index": g["index"], "driver": g.get("driver"),
+                         "index": g["index"], "uuid": g.get("uuid"), "driver": g.get("driver"),
                          "kernel_driver": "nvidia",
                          # is the driver's NVENC session cap patched out? (True/False/None)
                          "nvenc_unlocked": detect_nvenc_unlocked(g.get("driver"), sigs),
@@ -1832,11 +1833,26 @@ def stop_all():
 
 # ------------------------------------------------------------ ffmpeg commands
 def stream_env(gpu):
-    """Per-vendor environment (VAAPI driver selection)."""
+    """Per-vendor environment. VAAPI: driver selection. NVIDIA: pin the process to the card's
+    UUID via CUDA_VISIBLE_DEVICES — with 2+ NVIDIA cards, CUDA/NVENC enumerate fastest-first
+    while NVML orders by PCI bus, so a bare index means DIFFERENT cards in different code paths
+    (issue #7, reproduced live: -hwaccel_device 0 lit up a 2080 Ti while NVML index 0 was the
+    P2000). Masked, the process sees exactly one device, so no index can ever cross."""
     env = os.environ.copy()
     if gpu["api"] == "vaapi":
         env["LIBVA_DRIVER_NAME"] = "radeonsi" if gpu["vendor"] == "amd" else "iHD"
+    elif gpu.get("vendor") == "nvidia" and gpu.get("uuid"):
+        env["CUDA_VISIBLE_DEVICES"] = gpu["uuid"]
     return env
+
+
+def _nv_dev(gpu, flag):
+    """ffmpeg device-selection args for an NVIDIA gpu. With a UUID the env mask already
+    guarantees a single visible device (always in-process index 0), so NO argument is emitted;
+    the index form survives only for legacy detections without a UUID."""
+    if gpu.get("uuid"):
+        return []
+    return [flag, str(gpu["index"])] if gpu.get("index") is not None else []
 
 
 OUTPUT_BITRATE_BY_RES = {"4k": _env("OUTPUT_BITRATE_4K", "25M"),
@@ -1923,15 +1939,11 @@ def transcode_cmd(gpu, src, codec="h264", target_res="1080p", ten_bit=False, pre
             # and NVENC uploads system-memory frames itself. The trailing format=nv12 pin is
             # REQUIRED — without it the graph negotiates a format nvenc rejects
             # ("CreateInputBuffer failed: invalid param (8)", found live on the 5090).
-            dec = ["-hwaccel", "cuda"]
-            if gpu.get("index") is not None:
-                dec += ["-hwaccel_device", str(gpu["index"])]
+            dec = ["-hwaccel", "cuda"] + _nv_dev(gpu, "-hwaccel_device")
             vf = f"scale={w}:{h},subtitles=filename={BURNIN_ASS},format=nv12"
             out_pre = []                         # validated without -noautoscale (sw chain)
         else:
-            dec = ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
-            if gpu.get("index") is not None:
-                dec += ["-hwaccel_device", str(gpu["index"])]
+            dec = ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"] + _nv_dev(gpu, "-hwaccel_device")
             if hdr and not hdr_out:
                 vf = (f"tonemap_cuda=format=nv12:tonemap=bt2390:p=bt709:t=bt709:m=bt709,"
                       f"scale_cuda={w}:{h}")
@@ -3386,7 +3398,7 @@ def _rapl_telemetry(paths, gen, with_temp=False):
 def _nvidia_telemetry(gpu, gen):
     """Full telemetry via `nvidia-smi -q -x`: util, enc/dec %, temp, power, clock, throttle,
     and the process list (stashed under TELEMETRY['_procs'] for the active-apps check)."""
-    idx = str(gpu.get("index", 0))
+    idx = str(gpu.get("uuid") or gpu.get("index", 0))   # UUID: immune to ordering (issue #7)
     while not _TELE_STOP.is_set() and gen == _TELE_GEN:
         try:
             xml = subprocess.run(["nvidia-smi", "-i", idx, "-q", "-x"],
@@ -3441,8 +3453,8 @@ def gpu_mem_ours(gpu):
     try:
         if gpu["vendor"] == "nvidia":
             args = ["nvidia-smi"]
-            if gpu.get("index") is not None:
-                args += ["-i", str(gpu["index"])]
+            if gpu.get("uuid") or gpu.get("index") is not None:
+                args += ["-i", str(gpu.get("uuid") or gpu["index"])]
             out = subprocess.run(args + ["--query-compute-apps=pid,used_memory",
                                          "--format=csv,noheader,nounits"],
                                  capture_output=True, text=True, timeout=8).stdout
@@ -3504,8 +3516,8 @@ def gpu_mem_global(gpu):
     try:
         if gpu["vendor"] == "nvidia":
             args = ["nvidia-smi"]
-            if gpu.get("index") is not None:
-                args += ["-i", str(gpu["index"])]
+            if gpu.get("uuid") or gpu.get("index") is not None:
+                args += ["-i", str(gpu.get("uuid") or gpu["index"])]
             out = subprocess.run(args + ["--query-gpu=memory.used,memory.total",
                                          "--format=csv,noheader,nounits"],
                                  capture_output=True, text=True, timeout=8).stdout

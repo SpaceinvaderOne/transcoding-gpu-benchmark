@@ -1141,6 +1141,42 @@ class TestVramCapable(unittest.TestCase):
         self.assertFalse(benchmark.vram_capable({"vendor": "amd", "is_igpu": True}))
 
 
+class TestNvidiaUuidPinning(unittest.TestCase):
+    """Issue #7: with 2 NVIDIA cards, CUDA/NVENC enumerate fastest-first while NVML orders by
+    PCI bus, so a bare integer index means DIFFERENT cards in different code paths (reproduced
+    live on a P2000 + 2080 Ti box: ffmpeg -hwaccel_device 0 lit up the 2080 Ti at 99% while
+    NVML index 0 was the P2000). Fix: pin every ffmpeg to the card's UUID via
+    CUDA_VISIBLE_DEVICES — the masked process sees exactly ONE device, so no in-process index
+    argument is needed at all. nvidia-smi reads switch to the UUID too, so telemetry, VRAM and
+    the transcode can never disagree about which card they mean."""
+    NV_UUID = {"api": "nvenc", "vendor": "nvidia", "index": 1, "uuid": "GPU-e2b0849b"}
+    NV_LEGACY = {"api": "nvenc", "vendor": "nvidia", "index": 1}
+
+    def test_stream_env_masks_to_uuid(self):
+        env = benchmark.stream_env(self.NV_UUID)
+        self.assertEqual(env.get("CUDA_VISIBLE_DEVICES"), "GPU-e2b0849b")
+
+    def test_transcode_cmd_uuid_drops_device_arg(self):
+        cmd = benchmark.transcode_cmd(self.NV_UUID, "/x.mkv", "h264")
+        self.assertNotIn("-hwaccel_device", cmd)     # masked env: the only device IS device 0
+
+    def test_transcode_cmd_legacy_keeps_index(self):
+        cmd = benchmark.transcode_cmd(self.NV_LEGACY, "/x.mkv", "h264")
+        self.assertEqual(cmd[cmd.index("-hwaccel_device") + 1], "1")
+
+    def test_decode_probe_uuid_drops_device_arg(self):
+        cmd = benchmark.decode_probe_cmd(self.NV_UUID, "/x/probe.mkv")
+        self.assertNotIn("-hwaccel_device", cmd)
+
+    def test_subs_chain_uuid_drops_device_arg(self):
+        cmd = benchmark.transcode_cmd(self.NV_UUID, "/x.mkv", "h264", subs=True)
+        self.assertNotIn("-hwaccel_device", cmd)
+
+    def test_vaapi_untouched(self):
+        env = benchmark.stream_env({"api": "vaapi", "vendor": "amd", "device": "/dev/dri/renderD128"})
+        self.assertNotIn("CUDA_VISIBLE_DEVICES", env)
+
+
 class TestDecodeProbe(unittest.TestCase):
     """The decode probe must pipe frames through a GPU-only scale filter so a silent CPU
     fallback fails the probe instead of wrongly passing. A GTX 970 can NVENC-encode HEVC but
