@@ -356,7 +356,12 @@ async function handleTop(url, env) {
   // no client flag) fall back to the session-cap proxy so they still split correctly.
   const byKey = new Map();
   for (const row of results) {
-    const igpu = row.is_igpu === 1 || row.is_igpu === true || row.ram != null;
+    // RAM-classed devices: iGPUs, anything that reported RAM, and EVERY CPU row — a CPU is
+    // RAM-relevant by definition (the field is only missing when /dmi isn't mounted, e.g.
+    // Docker Desktop on Windows), so a RAM-less CPU run lands in the "(RAM unknown)" entity
+    // instead of minting a bare-name twin whose drill-down mixed everyone's runs together.
+    const igpu = row.is_igpu === 1 || row.is_igpu === true || row.ram != null
+              || row.vendor === "cpu";
     const gen = igpu ? (ramGen(row.ram) || "RAM unknown") : null;
     // dGPU VRAM capacity splits variants of the same card (8 GB vs 16 GB), the same way RAM
     // generation splits an iGPU. Shown inline "· 16 GB" like the "(DDR5)" tag.
