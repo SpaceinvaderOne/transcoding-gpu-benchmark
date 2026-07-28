@@ -704,7 +704,7 @@ td.effcell{color:var(--green)}
 <div class="toolbar">
   <input id="q" type="search" placeholder="🔍 Find your GPU…" autocomplete="off">
   <span class="vchips" id="vchips"></span>
-  <button id="vt" class="vtbtn" onclick="toggleView()">Show all runs &amp; failure detail</button>
+
 </div>
 <div id="xprof" class="xprof" style="display:none"></div>
 <table id="t"><thead><tr><th></th><th>GPU</th><th class="sortable" data-k="median_streams">Streams (median)<span class="tm" data-tip="How many 4K to 1080p transcodes the card kept above realtime all at once. We show the median of clean runs, not the single best, so it's what you'd typically get.">?</span><span class="arr" id="a-median_streams"></span></th><th class="sortable" data-k="best_streams">Best<span class="arr" id="a-best_streams"></span></th><th class="sortable eff" data-k="median_wps">≈W/stream<span class="tm" data-tip="Power used per simultaneous stream, in watts. Lower is more efficient. An iGPU sips power; a big discrete card only looks efficient when it's running lots of streams.">?</span><span class="arr" id="a-median_wps"></span></th><th class="sortable" data-k="count">Runs<span class="arr" id="a-count"></span></th></tr></thead>
@@ -900,14 +900,9 @@ async function toggle(tr, gpu, gen, hw, vram){
     det.firstChild.innerHTML=detailHtml(d);
   }catch(e){ det.firstChild.textContent="Could not load details."; }
 }
-let ALLVIEW=false, ROWS=[], SHOWALL=false, Q="", VEND="";
+let ROWS=[], SHOWALL=false, Q="", VEND="";
 let SORT={k:"median_streams",dir:-1};                    // default = performance ranking
 const TOPN=25;
-function toggleView(){
-  ALLVIEW=!ALLVIEW;
-  document.getElementById("vt").classList.toggle("on",ALLVIEW);
-  renderRows();
-}
 // ---- two-row workload navigation: profiles parsed into (source, output, subs) ----------------
 // Safe to parse: the server DERIVES/validates every stored profile string from structured
 // fields, so the format is a guarantee, not a convention.
@@ -1045,7 +1040,7 @@ function renderRows(){
       +' <span class="ccount">('+cnt+')'+(r.provisional?' <span class="prov">provisional</span>':'')+'</span>'
       +(r.count>1&&r.min_streams!==r.best_streams?' <span class="range">('+r.min_streams+'–'+r.best_streams+')</span>':'')
       +(r.understated?'<div class="under">measured under load — may understate</div>':'')
-      +(ALLVIEW&&!r.understated&&r.all_count>r.clean_count?'<div class="allline">all runs: median '+r.all_median+' ('+r.all_count+')</div>':'')
+
       +(r.mostly_capped?'<div class="cap2">engine throughput ≈'+esc(String(r.median_projected||"?"))+'× realtime — sessions capped by the driver</div>':'')+'</td>'
       +'<td class="num">'+r.best_streams+'</td>'
       +'<td class="num effcell">'+(r.median_wps!=null?r.median_wps:"—")
